@@ -367,12 +367,27 @@ function findSingleStar(s, from) {
   return -1;
 }
 
+/** The characters inlineTo treats specially: backslash, backtick, star,
+ * open bracket, and the five HTML-escaped characters. */
+const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
+
 /** `s` rendered inline into `out`; `env.link(target)` is a link's href. */
 export function inlineTo(s, env, out) {
   let i = 0;
   const n = s.length;
   let run = 0;
-  while (i < n) {
+  // Jump from one special character to the next with the regex engine
+  // (C++ scan) instead of stepping through every plain character in JS:
+  // under Sparkplug (no TurboFan here) the per-character dispatch loop is
+  // the single hottest function. lastIndex is set explicitly before every
+  // exec, so the recursive inlineTo calls (strong/em/link interiors) cannot
+  // corrupt this loop's scan position.
+  let m;
+  while (true) {
+    INLINE_SPECIAL.lastIndex = i;
+    m = INLINE_SPECIAL.exec(s);
+    if (m === null) break;
+    i = m.index;
     const code = s.charCodeAt(i);
     if (code === 92) {
       // backslash
@@ -434,8 +449,8 @@ export function inlineTo(s, env, out) {
     if (code === 91) {
       // [
       const k = findUnescaped(s, ']', i + 1);
-      const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
-      const target = m === -1 ? '' : s.slice(k + 2, m);
+      const m2 = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
+      const target = m2 === -1 ? '' : s.slice(k + 2, m2);
       if (target !== '' && !WS_RE.test(target)) {
         if (run < i) out.push(s.slice(run, i));
         out.push('<a href="');
@@ -443,21 +458,19 @@ export function inlineTo(s, env, out) {
         out.push('">');
         inlineTo(s.slice(i + 1, k), env, out);
         out.push('</a>');
-        i = m + 1;
+        i = m2 + 1;
         run = i;
       } else {
         i++;
       }
       continue;
     }
-    if (code === 38 || code === 60 || code === 62 || code === 34 || code === 39) {
-      if (run < i) out.push(s.slice(run, i));
-      out.push(ESCAPES[s[i]]);
-      i++;
-      run = i;
-      continue;
-    }
+    // One of & < > " ' (the regex only ever matches those plus the four
+    // handled above).
+    if (run < i) out.push(s.slice(run, i));
+    out.push(ESCAPES[s[i]]);
     i++;
+    run = i;
   }
   if (run < n) out.push(s.slice(run));
 }
@@ -896,19 +909,17 @@ export const REPORT_FILE = 'build-report.txt';
 export const RESERVED = Object.freeze(['posts', 'tags', 'page']);
 
 /** The words of a body: its runs of characters other than whitespace. */
+const WORD_RE = /\S+/g;
+
 function wordsOf(text) {
+  // \S is exactly this dialect's whitespace complement (space, tab, newline,
+  // VT, FF, CR, NBSP, ogham space, en/em spaces, line/paragraph separators,
+  // narrow NBSP, medium math space, ideographic space, BOM), so a run of
+  // \S is exactly a word; the regex engine scans in C++ and beats a
+  // per-character loop under Sparkplug (no TurboFan here) by ~3x.
   let n = 0;
-  let inWord = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    const ws = c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 160 || c === 0x1680 ||
-      (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
-    if (ws) inWord = false;
-    else if (!inWord) {
-      inWord = true;
-      n++;
-    }
-  }
+  WORD_RE.lastIndex = 0;
+  while (WORD_RE.exec(text) !== null) n++;
   return n;
 }
 
