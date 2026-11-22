@@ -8,8 +8,12 @@ import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
 // V8's incremental marking off, set before solve.js is imported so all of its work runs under it (the rules: the house
-// baseline runs with --no-incremental-marking, and an entry may tune V8's flags too).
-setFlagsFromString('--no-incremental-marking');
+// baseline runs with --no-incremental-marking, and an entry may tune V8's flags too). TurboFan's optimiser is off
+// as well: this entry runs three cases once each, so the optimiser's background compilation costs more CPU than
+// its faster code ever repays on so short a run; Sparkplug carries the work instead. The run is single-threaded
+// (one CPU in the sandbox, so background threads only contend for it) with a roomier young generation, so the
+// collector runs less often.
+setFlagsFromString('--no-incremental-marking --no-turbofan --single-threaded --max-semi-space-size=64');
 
 /** solve.js, imported by its URL (a .js module carries no types) and typed by its contract. */
 const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
@@ -20,4 +24,34 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8')) as { id: string; input: unknown }[];
 const answers: unknown[] = [];
 for (const c of cases) answers.push(run(c.input));
-writeFileSync(join(OUTPUT_DIR, 'answers.json'), JSON.stringify(answers));
+writeFileSync(join(OUTPUT_DIR, 'answers.json'), stringifyAnswers(answers));
+
+/**
+ * The answers as JSON. Each answer is a plain object of path -> text, so
+ * the array is built by hand with one JSON.stringify per string instead of
+ * the generic serializer's slow first pass over a multi-megabyte object
+ * (measured: ~48 ms against ~90 ms cold for the same bytes, identical
+ * output). Anything that is not that shape falls back to JSON.stringify.
+ */
+function stringifyAnswers(answers: unknown): string {
+  if (!Array.isArray(answers)) return JSON.stringify(answers);
+  let out = '[';
+  for (let i = 0; i < answers.length; i++) {
+    const obj = answers[i] as Record<string, unknown>;
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return JSON.stringify(answers);
+    if (i > 0) out += ',';
+    out += '{';
+    let first = true;
+    for (const k of Object.keys(obj)) {
+      const v = obj[k];
+      if (typeof v !== 'string') return JSON.stringify(answers);
+      if (!first) out += ',';
+      first = false;
+      out += JSON.stringify(k);
+      out += ':';
+      out += JSON.stringify(v);
+    }
+    out += '}';
+  }
+  return `${out}]`;
+}
