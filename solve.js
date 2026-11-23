@@ -117,6 +117,7 @@ export function longDate(date) {
 // ---------------------------------------------------------------- front matter
 
 const KEYS = ['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary'];
+const KEYS_SET = new Set(KEYS);
 const KEY = /^[a-z_]+$/;
 const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const NAME = /^[a-z0-9-]+$/;
@@ -215,7 +216,7 @@ export function parseFrontMatter(text) {
   const data = {};
   for (let idx = 0; idx < fmLines.length; idx++) {
     const line = fmLines[idx];
-    if (BLANK_RE.test(line) || line.startsWith('#')) continue;
+    if (isBlank(line) || line.startsWith('#')) continue;
     // `key: value`, hand-parsed instead of a regex exec per line (no match
     // array allocated): the key is [a-z_]+ up to the first ':', then either
     // end of line or ' ' plus the value.
@@ -227,8 +228,11 @@ export function parseFrontMatter(text) {
     if (c === line.length - 1) raw = '';
     else if (line.charCodeAt(c + 1) === 32) raw = line.slice(c + 2);
     else return { error: `line ${idx + 2} is not "key: value"` };
-    raw = raw.replace(/[ \t]+$/, '');
-    if (!KEYS.includes(key)) return { error: `unknown key "${key}"` };
+    // Trailing spaces/tabs dropped by a last-char check, not a regex.
+    let e = raw.length;
+    while (e > 0 && (raw.charCodeAt(e - 1) === 32 || raw.charCodeAt(e - 1) === 9)) e--;
+    if (e < raw.length) raw = raw.slice(0, e);
+    if (!KEYS_SET.has(key)) return { error: `unknown key "${key}"` };
     if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
     if (raw === '') return { error: `key "${key}" has no value` };
     const v = valueOf(key, raw);
@@ -346,34 +350,40 @@ function escapedBefore(s, pos, from) {
   return (n & 1) === 1;
 }
 
-/** The first index from `from` where `s` holds `what` outside an escape. */
-function findUnescaped(s, what, from) {
+/** The first index from `from` where `s` holds `what` outside an escape, fully inside [from, `to`). */
+function findUnescaped(s, what, from, to) {
   // A literal regex (C++ scan) plus a parity check on the backslash run
   // before the match: exactly the original per-character loop's semantics
   // (a backslash escapes only an escapable next character, so an odd run
   // before the match means its first character is escaped), without
   // stepping through every character in JS or calling startsWith per char.
+  // Matches are found in increasing order, so the first match at or past
+  // `to` ends the search: no later match can lie inside the range.
   const re = what === '**' ? FIND_DOUBLE_STAR : FIND_BRACKET;
   re.lastIndex = from;
   while (re.test(s)) {
     const pos = re.lastIndex - what.length;
+    if (pos + what.length > to) return -1;
     if (!escapedBefore(s, pos, from)) return pos;
     re.lastIndex = pos + 1;
   }
   return -1;
 }
 
-/** The first single * from `from` (one whose run is not **), outside an escape. */
-function findSingleStar(s, from) {
+/** The first single * from `from` (one whose run is not **), outside an escape, inside [from, `to`). */
+function findSingleStar(s, from, to) {
   // A run of L stars holds a single star exactly when L is odd (the pairs
   // consume the rest) — or, when the run's first star is escaped, when L is
   // even (the escape consumes one, leaving an odd remainder). Either way
-  // the single star, when it exists, is the run's last star.
+  // the single star, when it exists, is the run's last star. A run crossing
+  // `to` is cut there: the sliced string the old code scanned ended at `to`.
   FIND_STAR_RUN.lastIndex = from;
   while (FIND_STAR_RUN.test(s)) {
-    const end = FIND_STAR_RUN.lastIndex;
-    let start = end - 1;
+    const trueEnd = FIND_STAR_RUN.lastIndex;
+    let start = trueEnd - 1;
     while (start > from && s.charCodeAt(start - 1) === 42) start--;
+    if (start >= to) return -1;
+    const end = trueEnd > to ? to : trueEnd;
     const odd = ((end - start) & 1) === 1;
     if (odd !== escapedBefore(s, start, from)) return end - 1;
   }
@@ -384,11 +394,11 @@ function findSingleStar(s, from) {
  * open bracket, and the five HTML-escaped characters. */
 const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
 
-/** `s` rendered inline into `out`; `env.link(target)` is a link's href. */
-export function inlineTo(s, env, out) {
-  let i = 0;
-  const n = s.length;
-  let run = 0;
+/** `s[from:to]` rendered inline into `out`; `env.link(target)` is a link's href. */
+export function inlineTo(s, env, out, from = 0, to = s.length) {
+  let i = from;
+  const n = to;
+  let run = from;
   // Jump from one special character to the next with the regex engine
   // (C++ scan) instead of stepping through every plain character in JS:
   // under Sparkplug (no TurboFan here) the per-character dispatch loop is
@@ -397,10 +407,13 @@ export function inlineTo(s, env, out) {
   // corrupt this loop's scan position. test() is used instead of exec()
   // because the pattern matches exactly one character: the match index is
   // lastIndex - 1, and no result array is allocated per match.
+  // Interiors scan in place over [from, to) instead of a sliced copy: the
+  // slice allocated a string that was scanned once and thrown away.
   while (true) {
     INLINE_SPECIAL.lastIndex = i;
     if (!INLINE_SPECIAL.test(s)) break;
     i = INLINE_SPECIAL.lastIndex - 1;
+    if (i >= n) break;
     const code = s.charCodeAt(i);
     if (code === 92) {
       // backslash
@@ -418,7 +431,7 @@ export function inlineTo(s, env, out) {
     if (code === 96) {
       // backtick
       const j = s.indexOf('`', i + 1);
-      if (j > i + 1) {
+      if (j !== -1 && j < n && j > i + 1) {
         if (run < i) out.push(s.slice(run, i));
         out.push('<code>');
         escPush(s.slice(i + 1, j), out);
@@ -433,11 +446,11 @@ export function inlineTo(s, env, out) {
     if (code === 42) {
       // *
       if (s.charCodeAt(i + 1) === 42) {
-        const j = findUnescaped(s, '**', i + 2);
+        const j = findUnescaped(s, '**', i + 2, n);
         if (j > i + 2) {
           if (run < i) out.push(s.slice(run, i));
           out.push('<strong>');
-          inlineTo(s.slice(i + 2, j), env, out);
+          inlineTo(s, env, out, i + 2, j);
           out.push('</strong>');
           i = j + 2;
           run = i;
@@ -446,11 +459,11 @@ export function inlineTo(s, env, out) {
         }
         continue;
       }
-      const j = findSingleStar(s, i + 1);
+      const j = findSingleStar(s, i + 1, n);
       if (j > i + 1) {
         if (run < i) out.push(s.slice(run, i));
         out.push('<em>');
-        inlineTo(s.slice(i + 1, j), env, out);
+        inlineTo(s, env, out, i + 1, j);
         out.push('</em>');
         i = j + 1;
         run = i;
@@ -461,15 +474,15 @@ export function inlineTo(s, env, out) {
     }
     if (code === 91) {
       // [
-      const k = findUnescaped(s, ']', i + 1);
+      const k = findUnescaped(s, ']', i + 1, n);
       const m2 = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
-      const target = m2 === -1 ? '' : s.slice(k + 2, m2);
+      const target = m2 === -1 || m2 >= n ? '' : s.slice(k + 2, m2);
       if (target !== '' && !WS_RE.test(target)) {
         if (run < i) out.push(s.slice(run, i));
         out.push('<a href="');
         escPush(env.link(target), out);
         out.push('">');
-        inlineTo(s.slice(i + 1, k), env, out);
+        inlineTo(s, env, out, i + 1, k);
         out.push('</a>');
         i = m2 + 1;
         run = i;
@@ -485,7 +498,7 @@ export function inlineTo(s, env, out) {
     i++;
     run = i;
   }
-  if (run < n) out.push(s.slice(run));
+  if (run < n) out.push(s.slice(run, n));
 }
 
 /** `s` rendered inline, as a string. */
@@ -939,21 +952,44 @@ export function renderNodes(nodes, scope, ctx, depth, out) {
             } else {
               const keyVal = lookup(scope, [info.keyVar]);
               let byVal = ctx.varCache.get(n.name);
-              if (byVal === undefined) {
-                byVal = new Map();
-                ctx.varCache.set(n.name, byVal);
-              }
-              const hit = byVal.get(keyVal);
+              const hit = byVal === undefined ? undefined : byVal.get(keyVal);
               if (hit !== undefined && hit.depth + info.maxRel < INCLUDE_DEPTH) {
                 out.push(hit.str);
                 done = true;
               } else {
-                const tmp = [];
-                renderNodes(t, scope, ctx, childDepth, tmp);
-                const str = tmp.join('');
-                byVal.set(keyVal, { depth: childDepth, str });
-                out.push(str);
-                done = true;
+                // Probation: a key is cached only once it has been seen
+                // before. Most var-keyed templates are used once per value
+                // (measured on the practice set: 3,054 one-shot keys against
+                // 581 repeating ones); caching a one-shot render only pays a
+                // throwaway array + join + Map set and retains a string
+                // nobody reuses. The repeat-heavy template (`card`, 1,686
+                // repeat uses) keeps its hits this way — a primitive-keys-
+                // only rule would have dropped every hit, since all keys
+                // here are objects (or undefined).
+                let seen = ctx.varSeen.get(n.name);
+                if (seen === undefined) {
+                  seen = new Set();
+                  ctx.varSeen.set(n.name, seen);
+                }
+                if (!seen.has(keyVal)) {
+                  seen.add(keyVal);
+                  renderNodes(t, scope, ctx, childDepth, out);
+                  done = true;
+                } else if (byVal === undefined || byVal.size < 1024) {
+                  if (byVal === undefined) {
+                    byVal = new Map();
+                    ctx.varCache.set(n.name, byVal);
+                  }
+                  const tmp = [];
+                  renderNodes(t, scope, ctx, childDepth, tmp);
+                  const str = tmp.join('');
+                  byVal.set(keyVal, { depth: childDepth, str });
+                  out.push(str);
+                  done = true;
+                } else {
+                  renderNodes(t, scope, ctx, childDepth, out);
+                  done = true;
+                }
               }
             }
           }
@@ -972,17 +1008,33 @@ export const RESERVED = Object.freeze(['posts', 'tags', 'page']);
 
 /** The words of a body: its runs of characters other than whitespace. */
 const WORD_RE = /\S+/g;
+const WORD_CHUNK_RE = /\s*\S+(?:\s+\S+){27}/y;
 
 function wordsOf(text) {
-  // \S is exactly this dialect's whitespace complement (space, tab, newline,
-  // VT, FF, CR, NBSP, ogham space, en/em spaces, line/paragraph separators,
-  // narrow NBSP, medium math space, ideographic space, BOM), so a run of
-  // \S is exactly a word; the regex engine scans in C++ and beats a
-  // per-character loop under Sparkplug (no TurboFan here) by ~3x. test() is
-  // used instead of exec() because only the count matters: no result array
-  // is allocated per word.
+  // \S is exactly this dialect's whitespace complement, so a run of \S is
+  // exactly a word. One C++ match counts 28 words at a time instead of one
+  // test() per word; the <28 remainder takes the plain loop. (28 is the
+  // measured sweet spot: chunk matches cost ~425755/28 calls and the
+  // remainder ~14 per body; 100-word chunks measured slower at 18.5 ms
+  // against 15 ms for 28.) The chunk regex is sticky (/y): it tries only
+  // at lastIndex, never scans forward for a start position, so a short tail
+  // fails after a single pass instead of the O(chars x words) rescan a /g
+  // pattern does (that version measured 2x SLOWER than the per-word loop).
+  // The separator inside the group is \s+ (required), not \s*: a \s* before
+  // every word lets the engine split one long word across the repetitions
+  // in exponentially many ways — that version hung on a 500-character word.
+  // The leading \s* sits outside the group, so it can only eat the gap
+  // after the previous chunk. Each match is exactly 28 words. (The position
+  // is saved per match: a failing test() resets lastIndex to 0, so it
+  // cannot be read after the loop.)
   let n = 0;
-  WORD_RE.lastIndex = 0;
+  let pos = 0;
+  WORD_CHUNK_RE.lastIndex = 0;
+  while (WORD_CHUNK_RE.test(text)) {
+    n += 28;
+    pos = WORD_CHUNK_RE.lastIndex;
+  }
+  WORD_RE.lastIndex = pos;
   while (WORD_RE.test(text)) n++;
   return n;
 }
@@ -1186,7 +1238,7 @@ export function build(input) {
   const site = { title: b.input.site.title, base_url: b.base };
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
-  const ctx = { templates: b.templates, constInfo: analyzeTemplates(b.templates), constCache: new Map(), varCache: new Map() };
+  const ctx = { templates: b.templates, constInfo: analyzeTemplates(b.templates), constCache: new Map(), varCache: new Map(), varSeen: new Map() };
   const render = (name, vars) => {
     const nodes = b.templates.get(name);
     if (nodes === undefined) return null;
