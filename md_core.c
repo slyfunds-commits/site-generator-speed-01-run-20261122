@@ -36,6 +36,7 @@ static inline vec16 v_or(vec16 a, vec16 b) { return wasm_v128_or(a, b); }
 static inline unsigned v_mask(vec16 a) { return (unsigned)wasm_i8x16_bitmask(a); }
 #elif defined(__x86_64__) || defined(__i386__)
 #include <emmintrin.h>
+#include <immintrin.h>
 typedef __m128i vec16;
 #define MD_HAVE_SIMD 1
 static inline vec16 v_load(const unsigned char *p) { return _mm_loadu_si128((const __m128i *)p); }
@@ -43,6 +44,20 @@ static inline vec16 v_splat(unsigned char c) { return _mm_set1_epi8((char)c); }
 static inline vec16 v_eq(vec16 a, vec16 b) { return _mm_cmpeq_epi8(a, b); }
 static inline vec16 v_or(vec16 a, vec16 b) { return _mm_or_si128(a, b); }
 static inline unsigned v_mask(vec16 a) { return (unsigned)_mm_movemask_epi8(a); }
+/* AVX2 dispatch (round 8 Phase 2): 32-byte kernels with SSE2 fallback.
+ * Test builds force a path with -DFORCE_AVX2 / -DFORCE_SSE2; otherwise
+ * CPUID auto-detect (checks OS AVX support too). Never -march=native. */
+static inline int md_use_avx2(void) {
+#if defined(FORCE_AVX2)
+  return 1;
+#elif defined(FORCE_SSE2)
+  return 0;
+#else
+  static int cached = -1;
+  if (cached < 0) cached = __builtin_cpu_supports("avx2") ? 1 : 0;
+  return cached;
+#endif
+}
 #endif
 
 typedef unsigned char u8;
@@ -82,8 +97,15 @@ static u32 excerpt_len;
 static int excerpt_set;
 static int overflow_flag;
 
-/* ---- tiny memcpy (no libc; -fno-builtin keeps clang from synthesising calls) ---- */
+/* ---- tiny memcpy (no libc; -fno-builtin keeps clang from synthesising calls) ----
+ * 4-byte-at-a-time via byte-assembled u32 (portable, no unaligned UB —
+ * the compiler emits a single unaligned load/store on x86/wasm). */
 static void md_memcpy(u8 *d, const u8 *s, unsigned n) {
+  while (n >= 4) {
+    u32 v = (u32)s[0] | ((u32)s[1] << 8) | ((u32)s[2] << 16) | ((u32)s[3] << 24);
+    d[0] = (u8)v; d[1] = (u8)(v >> 8); d[2] = (u8)(v >> 16); d[3] = (u8)(v >> 24);
+    d += 4; s += 4; n -= 4;
+  }
   while (n--) *d++ = *s++;
 }
 
@@ -119,8 +141,25 @@ static void join_byte(u8 b) {
 
 /* ---- SIMD chunk scanners (simdjson stage-1 shape: 16-byte blocks, bitmask, ctz) ---- */
 
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2")))
+static const u8 *find_byte_avx2(const u8 *p, const u8 *end, u8 c) {
+  __m256i vc = _mm256_set1_epi8((char)c);
+  while (end - p >= 32) {
+    unsigned m = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i *)p), vc));
+    if (m) return p + __builtin_ctz(m);
+    p += 32;
+  }
+  while (p < end) { if (*p == c) return p; p++; }
+  return end;
+}
+#endif
+
 /* First byte in [p,end) equal to c, or end. */
 static const u8 *find_byte(const u8 *p, const u8 *end, u8 c) {
+#if defined(__x86_64__) || defined(__i386__)
+  if (md_use_avx2()) return find_byte_avx2(p, end, c);
+#endif
 #ifdef MD_HAVE_SIMD
   vec16 vc = v_splat(c);
   while (end - p >= 16) {
@@ -133,8 +172,36 @@ static const u8 *find_byte(const u8 *p, const u8 *end, u8 c) {
   return end;
 }
 
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2")))
+static const u8 *find_esc_avx2(const u8 *p, const u8 *end) {
+  __m256i am = _mm256_set1_epi8('&'), lt = _mm256_set1_epi8('<'), gt = _mm256_set1_epi8('>'),
+          dq = _mm256_set1_epi8('"'), sq = _mm256_set1_epi8('\'');
+  while (end - p >= 32) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)p);
+    __m256i m = _mm256_cmpeq_epi8(v, am);
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, lt));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, gt));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, dq));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, sq));
+    unsigned mask = (unsigned)_mm256_movemask_epi8(m);
+    if (mask) return p + __builtin_ctz(mask);
+    p += 32;
+  }
+  while (p < end) {
+    u8 c = *p;
+    if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'') return p;
+    p++;
+  }
+  return end;
+}
+#endif
+
 /* First escapable byte (& < > " ') in [p,end), or end. */
 static const u8 *find_esc(const u8 *p, const u8 *end) {
+#if defined(__x86_64__) || defined(__i386__)
+  if (md_use_avx2()) return find_esc_avx2(p, end);
+#endif
 #ifdef MD_HAVE_SIMD
   vec16 am = v_splat('&'), lt = v_splat('<'), gt = v_splat('>'),
         dq = v_splat('"'), sq = v_splat('\'');
@@ -158,9 +225,44 @@ static const u8 *find_esc(const u8 *p, const u8 *end) {
   return end;
 }
 
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2")))
+static const u8 *find_special_avx2(const u8 *p, const u8 *end) {
+  __m256i bs = _mm256_set1_epi8('\\'), bt = _mm256_set1_epi8('`'), st = _mm256_set1_epi8('*'), ob = _mm256_set1_epi8('['),
+          am = _mm256_set1_epi8('&'), lt = _mm256_set1_epi8('<'), gt = _mm256_set1_epi8('>'),
+          dq = _mm256_set1_epi8('"'), sq = _mm256_set1_epi8('\'');
+  while (end - p >= 32) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)p);
+    __m256i m = _mm256_cmpeq_epi8(v, bs);
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, bt));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, st));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, ob));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, am));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, lt));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, gt));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, dq));
+    m = _mm256_or_si256(m, _mm256_cmpeq_epi8(v, sq));
+    unsigned mask = (unsigned)_mm256_movemask_epi8(m);
+    if (mask) return p + __builtin_ctz(mask);
+    p += 32;
+  }
+  while (p < end) {
+    u8 c = *p;
+    if (c == '\\' || c == '`' || c == '*' || c == '[' || c == '&' ||
+        c == '<' || c == '>' || c == '"' || c == '\'')
+      return p;
+    p++;
+  }
+  return end;
+}
+#endif
+
 /* First byte in [p,end) in the inline-special set, or end.
  * Set (JS INLINE_SPECIAL): \ ` * [ & < > " ' */
 static const u8 *find_special(const u8 *p, const u8 *end) {
+#if defined(__x86_64__) || defined(__i386__)
+  if (md_use_avx2()) return find_special_avx2(p, end);
+#endif
 #ifdef MD_HAVE_SIMD
   vec16 bs = v_splat('\\'), bt = v_splat('`'), st = v_splat('*'), ob = v_splat('['),
         am = v_splat('&'), lt = v_splat('<'), gt = v_splat('>'),

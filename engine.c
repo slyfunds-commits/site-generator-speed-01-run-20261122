@@ -77,6 +77,20 @@ static uint64_t g_step_t0;
 #define STEP_BEGIN(n) do { g_step_cur = (n); g_step_t0 = t_now_us(); } while (0)
 #define STEP_END() do { if (g_step_cur >= 0) g_step_us[g_step_cur] += t_now_us() - g_step_t0; g_step_cur = -1; } while (0)
 
+#ifdef ENGINE_TEST_MAIN
+// ---- op counters (test builds only; zero cost in the .node) ----
+static uint64_t c_op_text, c_op_var, c_op_raw, c_op_if, c_op_for, c_op_inc;
+static uint64_t c_text_bytes, c_render_range, c_render_named;
+static uint64_t c_lookup, c_lookup_cmp, c_lookup_miss;
+static uint64_t c_memo_call, c_buf_grow;
+static uint64_t c_fold_renders, c_fold_fallback, c_inline_splices, c_fold_templates;
+// rdtsc cycle accumulators (diagnostic only)
+static inline uint64_t rdtsc_now(void) { uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
+static uint64_t cy_lookup, cy_memo_setup, cy_memo_missrender, cy_memo_hit;
+static uint64_t cy_esc, cy_for_setup, cy_text, cy_vfield;
+static uint64_t c_memo_r0_analysis, c_memo_r0_free, c_memo_r0_loop, c_memo_r0_ndep, c_memo_r0_depnull;
+#endif
+
 // ---------------------------------------------------------------- arena
 typedef struct { uint8_t *base, *cur, *end; } Arena;
 static void arena_init(Arena *a, size_t cap) {
@@ -116,7 +130,25 @@ static uint32_t u16_next(U16Iter *it) {
 }
 static int str_cmp(Str a, Str b) {
   // code-unit order (UTF-16 code units) like JS.
-  U16Iter ia = { a.p, a.p + a.len, 0, 0 }, ib = { b.p, b.p + b.len, 0, 0 };
+  // Fast path: while both bytes are equal ASCII, code units == bytes, so a
+  // byte compare decides. On the first non-ASCII (or differing non-ASCII)
+  // byte, fall through to the U16Iter loop from that offset.
+  size_t n = a.len < b.len ? a.len : b.len;
+  size_t i = 0;
+  while (i < n) {
+    uint8_t ca = a.p[i], cb = b.p[i];
+    if (ca != cb) {
+      if (ca < 0x80 && cb < 0x80) return ca < cb ? -1 : 1;
+      break;
+    }
+    if (ca >= 0x80) break;
+    i++;
+  }
+  if (i == n) {
+    if (a.len == b.len) return 0;
+    return a.len < b.len ? -1 : 1;
+  }
+  U16Iter ia = { a.p + i, a.p + a.len, 0, 0 }, ib = { b.p + i, b.p + b.len, 0, 0 };
   for (;;) {
     uint32_t ua = u16_next(&ia), ub = u16_next(&ib);
     if (ua == 0xFFFFFFFFu && ub == 0xFFFFFFFFu) return 0;
@@ -165,9 +197,27 @@ static void buf_putc(Buf *b, uint8_t c) { buf_reserve(b, 1); b->buf[b->len++] = 
 static void buf_puts(Buf *b, const char *s) { buf_put(b, s, __builtin_strlen(s)); }
 static void buf_put_str(Buf *b, Str s) { buf_put(b, s.p, s.len); }
 
+// ---------------------------------------------------------------- SIMD dispatch (round 8 Phase 2)
+// AVX2 kernels with SSE2 fallback, chosen once at load via CPUID.
+// __builtin_cpu_supports checks OS AVX support (XCR0) as well as the CPU.
+// Test builds can force a path: -DFORCE_AVX2 / -DFORCE_SSE2 (the .node
+// build defines neither -> auto-detect). Never -march=native.
+static inline int eng_use_avx2(void) {
+#if defined(FORCE_AVX2)
+  return 1;
+#elif defined(FORCE_SSE2)
+  return 0;
+#else
+  static int cached = -1;
+  if (cached < 0) cached = __builtin_cpu_supports("avx2") ? 1 : 0;
+  return cached;
+#endif
+}
+
 // ---------------------------------------------------------------- JSON parse (recursive descent over bytes, fills structs)
 typedef struct { const uint8_t *p, *end; Arena *arena; } J;
-static void j_ws(J *j) {
+__attribute__((target("sse2")))
+static void j_ws_sse2(J *j) {
   // SIMD skip of JSON whitespace (space, tab, LF, CR), 16 bytes at a time.
   __m128i v20 = _mm_set1_epi8(' ');
   __m128i v09 = _mm_set1_epi8('\t');
@@ -190,6 +240,31 @@ static void j_ws(J *j) {
     else break;
   }
 }
+__attribute__((target("avx2")))
+static void j_ws_avx2(J *j) {
+  __m256i v20 = _mm256_set1_epi8(' ');
+  __m256i v09 = _mm256_set1_epi8('\t');
+  __m256i v0a = _mm256_set1_epi8('\n');
+  __m256i v0d = _mm256_set1_epi8('\r');
+  while (j->p + 32 <= j->end) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)j->p);
+    __m256i m = _mm256_or_si256(_mm256_cmpeq_epi8(v, v20),
+                  _mm256_or_si256(_mm256_cmpeq_epi8(v, v09),
+                  _mm256_or_si256(_mm256_cmpeq_epi8(v, v0a), _mm256_cmpeq_epi8(v, v0d))));
+    uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
+    if (mask == 0xFFFFFFFFu) { j->p += 32; continue; }
+    j->p += (size_t)__builtin_ctz(~mask);
+    return;
+  }
+  while (j->p < j->end) {
+    uint8_t c = *j->p;
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') j->p++;
+    else break;
+  }
+}
+static void j_ws(J *j) {
+  if (eng_use_avx2()) j_ws_avx2(j); else j_ws_sse2(j);
+}
 static int j_lit(J *j, const char *lit) {
   size_t n = __builtin_strlen(lit);
   if ((size_t)(j->end - j->p) < n || __builtin_memcmp(j->p, lit, n) != 0) return 0;
@@ -198,26 +273,42 @@ static int j_lit(J *j, const char *lit) {
 }
 // Parse a JSON string; returns unescaped UTF-8 (arena). Fast path: no
 // backslash -> slice of the input (no copy).
-static Str j_string(J *j) {
-  // assumes *p == '"'
-  j->p++;
-  const uint8_t *start = j->p;
-  const uint8_t *p = j->p;
-  // SIMD fast scan for '"' or '\\' (16 bytes at a time); the scalar tail
-  // covers the last <16 bytes. Zero-copy for clean strings (a view into the
-  // input); the slow path below only runs when an escape is present.
+// SIMD fast scan for '"' or '\\'; the scalar tail covers the last <16/32
+// bytes. Zero-copy for clean strings (a view into the input); the slow path
+// below only runs when an escape is present.
+__attribute__((target("sse2")))
+static const uint8_t *jstr_scan_sse2(const uint8_t *p, const uint8_t *end) {
   __m128i vq = _mm_set1_epi8('"');
   __m128i vb = _mm_set1_epi8('\\');
-  while (p + 16 <= j->end) {
+  while (p + 16 <= end) {
     __m128i v = _mm_loadu_si128((const __m128i *)p);
     __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, vq), _mm_cmpeq_epi8(v, vb));
     unsigned mask = (unsigned)_mm_movemask_epi8(m);
     if (!mask) { p += 16; continue; }
-    p += (size_t)__builtin_ctz(mask);
-    goto jstr_found;
+    return p + (size_t)__builtin_ctz(mask);
   }
-  while (p < j->end && *p != '"' && *p != '\\') p++;
-jstr_found:
+  while (p < end && *p != '"' && *p != '\\') p++;
+  return p;
+}
+__attribute__((target("avx2")))
+static const uint8_t *jstr_scan_avx2(const uint8_t *p, const uint8_t *end) {
+  __m256i vq = _mm256_set1_epi8('"');
+  __m256i vb = _mm256_set1_epi8('\\');
+  while (p + 32 <= end) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)p);
+    __m256i m = _mm256_or_si256(_mm256_cmpeq_epi8(v, vq), _mm256_cmpeq_epi8(v, vb));
+    uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
+    if (!mask) { p += 32; continue; }
+    return p + (size_t)__builtin_ctz(mask);
+  }
+  while (p < end && *p != '"' && *p != '\\') p++;
+  return p;
+}
+static Str j_string(J *j) {
+  // assumes *p == '"'
+  j->p++;
+  const uint8_t *start = j->p;
+  const uint8_t *p = eng_use_avx2() ? jstr_scan_avx2(j->p, j->end) : jstr_scan_sse2(j->p, j->end);
   if (p < j->end && *p == '"') {
     Str r = { start, (size_t)(p - start) };
     j->p = p + 1;
@@ -333,7 +424,8 @@ static void j_skip(J *j) {
 // SSE2 mask-draining scan: bytes needing escape are <0x20, '"' (0x22),
 // '\\' (0x5C), or 0xED (WTF-8 lone-surrogate lead).
 static const char HEXD[] = "0123456789abcdef";
-static void json_emit_str(Buf *b, Str s) {
+__attribute__((target("sse2")))
+static void json_emit_str_sse2(Buf *b, Str s) {
   // Fast path: reserve room for the string + typical escape expansion (25%)
   // and write through a raw cursor -- no per-hit buf_put calls. The answers
   // carry ~280k escapes (every \" and \n in the html), and each buf_put was
@@ -486,8 +578,167 @@ emit_slow:
   buf_putc(b, '"');
 }
 
+__attribute__((target("avx2")))
+static void json_emit_str_avx2(Buf *b, Str s) {
+  // Fast path: reserve room for the string + typical escape expansion (25%)
+  // and write through a raw cursor -- no per-hit buf_put calls. The answers
+  // carry ~280k escapes (every \" and \n in the html), and each buf_put was
+  // a function call + reserve check. On overflow (pathological escape
+  // density) fall through to the slow buf_put loop for the remainder; the
+  // opening quote is already written and p/run are the resume point.
+  const uint8_t *p = s.p, *end = s.p + s.len;
+  const uint8_t *run = p;
+  buf_reserve(b, s.len + s.len / 4 + 18);
+  uint8_t *dst = b->buf + b->len;
+  uint8_t *dst_end = b->buf + b->cap;
+  __m256i v22 = _mm256_set1_epi8(0x22);
+  __m256i v5c = _mm256_set1_epi8(0x5C);
+  __m256i ved = _mm256_set1_epi8((char)0xED);
+  // Unsigned byte < 0x20 via the XOR-0x80 bias trick: _mm256_cmplt_epi8 is
+  // SIGNED, so a plain compare would also flag every byte >= 0x80
+  // (non-ASCII UTF-8) as "needs escape" and corrupt it. (This was a real
+  // bug: 1011/1024 practice bodies mismatched before the fix.)
+  __m256i vbias = _mm256_set1_epi8((char)0x80);
+  __m256i vlt = _mm256_set1_epi8((char)0xA0); // 0x20 ^ 0x80
+  *dst++ = '"';
+  while (p + 32 <= end) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)p);
+    __m256i m = _mm256_or_si256(_mm256_cmpgt_epi8(vlt, _mm256_xor_si256(v, vbias)),
+                  _mm256_or_si256(_mm256_cmpeq_epi8(v, v22),
+                  _mm256_or_si256(_mm256_cmpeq_epi8(v, v5c), _mm256_cmpeq_epi8(v, ved))));
+    uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
+    if (!mask) { p += 32; continue; }
+    unsigned bit = __builtin_ctz(mask);
+    const uint8_t *hit = p + bit;
+    size_t runlen = (size_t)(hit - run);
+    if (dst + runlen + 6 > dst_end) goto emit_slow;
+    if (runlen) { __builtin_memcpy(dst, run, runlen); dst += runlen; }
+    uint8_t c = *hit;
+    if (c == '"') { dst[0] = '\\'; dst[1] = '"'; dst += 2; }
+    else if (c == '\\') { dst[0] = '\\'; dst[1] = '\\'; dst += 2; }
+    else if (c == '\b') { dst[0] = '\\'; dst[1] = 'b'; dst += 2; }
+    else if (c == '\f') { dst[0] = '\\'; dst[1] = 'f'; dst += 2; }
+    else if (c == '\n') { dst[0] = '\\'; dst[1] = 'n'; dst += 2; }
+    else if (c == '\r') { dst[0] = '\\'; dst[1] = 'r'; dst += 2; }
+    else if (c == '\t') { dst[0] = '\\'; dst[1] = 't'; dst += 2; }
+    else if (c < 0x20) {
+      dst[0] = '\\'; dst[1] = 'u'; dst[2] = '0'; dst[3] = '0';
+      dst[4] = (uint8_t)HEXD[c >> 4]; dst[5] = (uint8_t)HEXD[c & 15]; dst += 6;
+    } else { // 0xED: WTF-8 lone surrogate ED A0..BF xx -> \uDXXX
+      if (hit + 2 < end && (hit[1] & 0xE0) == 0xA0) {
+        uint32_t cp = ((hit[1] & 0xF0) == 0xA0 ? 0xD800 : 0xDC00) + ((hit[1] & 0x0F) << 6) + (hit[2] & 0x3F);
+        dst[0] = '\\'; dst[1] = 'u';
+        dst[2] = (uint8_t)HEXD[(cp >> 12) & 15]; dst[3] = (uint8_t)HEXD[(cp >> 8) & 15];
+        dst[4] = (uint8_t)HEXD[(cp >> 4) & 15]; dst[5] = (uint8_t)HEXD[cp & 15]; dst += 6;
+        p = hit + 3; run = p;
+        continue;
+      }
+      *dst++ = c;
+      p = hit + 1; run = p;
+      continue;
+    }
+    p = hit + 1; run = p;
+  }
+  while (p < end) {
+    uint8_t c = *p;
+    if (c < 0x20 || c == '"' || c == '\\' || c == 0xED) {
+      size_t runlen = (size_t)(p - run);
+      if (dst + runlen + 6 > dst_end) goto emit_slow;
+      if (runlen) { __builtin_memcpy(dst, run, runlen); dst += runlen; }
+      if (c == '"') { dst[0] = '\\'; dst[1] = '"'; dst += 2; }
+      else if (c == '\\') { dst[0] = '\\'; dst[1] = '\\'; dst += 2; }
+      else if (c == '\b') { dst[0] = '\\'; dst[1] = 'b'; dst += 2; }
+      else if (c == '\f') { dst[0] = '\\'; dst[1] = 'f'; dst += 2; }
+      else if (c == '\n') { dst[0] = '\\'; dst[1] = 'n'; dst += 2; }
+      else if (c == '\r') { dst[0] = '\\'; dst[1] = 'r'; dst += 2; }
+      else if (c == '\t') { dst[0] = '\\'; dst[1] = 't'; dst += 2; }
+      else if (c < 0x20) {
+        dst[0] = '\\'; dst[1] = 'u'; dst[2] = '0'; dst[3] = '0';
+        dst[4] = (uint8_t)HEXD[c >> 4]; dst[5] = (uint8_t)HEXD[c & 15]; dst += 6;
+      } else if (p + 2 < end && (p[1] & 0xE0) == 0xA0) {
+        uint32_t cp = ((p[1] & 0xF0) == 0xA0 ? 0xD800 : 0xDC00) + ((p[1] & 0x0F) << 6) + (p[2] & 0x3F);
+        dst[0] = '\\'; dst[1] = 'u';
+        dst[2] = (uint8_t)HEXD[(cp >> 12) & 15]; dst[3] = (uint8_t)HEXD[(cp >> 8) & 15];
+        dst[4] = (uint8_t)HEXD[(cp >> 4) & 15]; dst[5] = (uint8_t)HEXD[cp & 15]; dst += 6;
+        p += 3; run = p;
+        continue;
+      } else *dst++ = c;
+      p++; run = p;
+    } else p++;
+  }
+  {
+    size_t runlen = (size_t)(end - run);
+    if (dst + runlen + 1 > dst_end) goto emit_slow;
+    if (runlen) { __builtin_memcpy(dst, run, runlen); dst += runlen; }
+    *dst++ = '"';
+    b->len = (size_t)(dst - b->buf);
+    return;
+  }
+emit_slow:
+  // Commit what the fast path wrote, then continue with the buf_put loop
+  // from (p, run). The opening quote is already emitted.
+  b->len = (size_t)(dst - b->buf);
+  while (p + 32 <= end) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)p);
+    __m256i m = _mm256_or_si256(_mm256_cmpgt_epi8(vlt, _mm256_xor_si256(v, vbias)),
+                  _mm256_or_si256(_mm256_cmpeq_epi8(v, v22),
+                  _mm256_or_si256(_mm256_cmpeq_epi8(v, v5c), _mm256_cmpeq_epi8(v, ved))));
+    uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
+    if (!mask) { p += 32; continue; }
+    unsigned bit = __builtin_ctz(mask);
+    const uint8_t *hit = p + bit;
+    if (hit > run) buf_put(b, run, (size_t)(hit - run));
+    uint8_t c = *hit;
+    if (c == '"') buf_puts(b, "\\\"");
+    else if (c == '\\') buf_puts(b, "\\\\");
+    else if (c == '\b') buf_puts(b, "\\b");
+    else if (c == '\f') buf_puts(b, "\\f");
+    else if (c == '\n') buf_puts(b, "\\n");
+    else if (c == '\r') buf_puts(b, "\\r");
+    else if (c == '\t') buf_puts(b, "\\t");
+    else if (c < 0x20) { char e[7] = { '\\', 'u', '0', '0', HEXD[c >> 4], HEXD[c & 15], 0 }; buf_put(b, e, 6); }
+    else if (hit + 2 < end && (hit[1] & 0xE0) == 0xA0) {
+      uint32_t cp = ((hit[1] & 0xF0) == 0xA0 ? 0xD800 : 0xDC00) + ((hit[1] & 0x0F) << 6) + (hit[2] & 0x3F);
+      char e[7] = { '\\', 'u', HEXD[(cp >> 12) & 15], HEXD[(cp >> 8) & 15], HEXD[(cp >> 4) & 15], HEXD[cp & 15], 0 };
+      buf_put(b, e, 6);
+      p = hit + 3; run = p;
+      continue;
+    } else buf_putc(b, c);
+    p = hit + 1; run = p;
+  }
+  while (p < end) {
+    uint8_t c = *p;
+    if (c < 0x20 || c == '"' || c == '\\' || c == 0xED) {
+      if (p > run) buf_put(b, run, (size_t)(p - run));
+      if (c == '"') buf_puts(b, "\\\"");
+      else if (c == '\\') buf_puts(b, "\\\\");
+      else if (c == '\b') buf_puts(b, "\\b");
+      else if (c == '\f') buf_puts(b, "\\f");
+      else if (c == '\n') buf_puts(b, "\\n");
+      else if (c == '\r') buf_puts(b, "\\r");
+      else if (c == '\t') buf_puts(b, "\\t");
+      else if (c < 0x20) { char e[7] = { '\\', 'u', '0', '0', HEXD[c >> 4], HEXD[c & 15], 0 }; buf_put(b, e, 6); }
+      else if (p + 2 < end && (p[1] & 0xE0) == 0xA0) {
+        uint32_t cp = ((p[1] & 0xF0) == 0xA0 ? 0xD800 : 0xDC00) + ((p[1] & 0x0F) << 6) + (p[2] & 0x3F);
+        char e[7] = { '\\', 'u', HEXD[(cp >> 12) & 15], HEXD[(cp >> 8) & 15], HEXD[(cp >> 4) & 15], HEXD[cp & 15], 0 };
+        buf_put(b, e, 6);
+        p += 3; run = p;
+        continue;
+      } else buf_putc(b, c);
+      p++; run = p;
+    } else p++;
+  }
+  if (end > run) buf_put(b, run, (size_t)(end - run));
+  buf_putc(b, '"');
+}
+
+static void json_emit_str(Buf *b, Str s) {
+  if (eng_use_avx2()) json_emit_str_avx2(b, s); else json_emit_str_sse2(b, s);
+}
+
 // ---------------------------------------------------------------- text
-static void esc_html_buf(Buf *b, Str s) {
+__attribute__((target("sse2")))
+static void esc_html_buf_sse2(Buf *b, Str s) {
   // escape & < > " '  (SSE2 scan for the set)
   const uint8_t *p = s.p, *end = s.p + s.len;
   const uint8_t *run = p;
@@ -531,6 +782,55 @@ static void esc_html_buf(Buf *b, Str s) {
     } else p++;
   }
   if (end > run) buf_put(b, run, (size_t)(end - run));
+}
+__attribute__((target("avx2")))
+static void esc_html_buf_avx2(Buf *b, Str s) {
+  // escape & < > " '  (AVX2 scan for the set, 32 bytes at a time)
+  const uint8_t *p = s.p, *end = s.p + s.len;
+  const uint8_t *run = p;
+  __m256i v26 = _mm256_set1_epi8(0x26);
+  __m256i v3c = _mm256_set1_epi8(0x3C);
+  __m256i v3e = _mm256_set1_epi8(0x3E);
+  __m256i v22 = _mm256_set1_epi8(0x22);
+  __m256i v27 = _mm256_set1_epi8(0x27);
+  while (p + 32 <= end) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)p);
+    __m256i m = _mm256_or_si256(_mm256_cmpeq_epi8(v, v26),
+                  _mm256_or_si256(_mm256_cmpeq_epi8(v, v3c),
+                  _mm256_or_si256(_mm256_cmpeq_epi8(v, v3e),
+                  _mm256_or_si256(_mm256_cmpeq_epi8(v, v22), _mm256_cmpeq_epi8(v, v27)))));
+    uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
+    if (!mask) { p += 32; continue; }
+    unsigned bit = __builtin_ctz(mask);
+    const uint8_t *hit = p + bit;
+    if (hit > run) buf_put(b, run, (size_t)(hit - run));
+    switch (*hit) {
+      case '&': buf_puts(b, "&amp;"); break;
+      case '<': buf_puts(b, "&lt;"); break;
+      case '>': buf_puts(b, "&gt;"); break;
+      case '"': buf_puts(b, "&quot;"); break;
+      default: buf_puts(b, "&#39;"); break;
+    }
+    p = hit + 1; run = p;
+  }
+  while (p < end) {
+    uint8_t c = *p;
+    if (c == '&' || c == '<' || c == '>' || c == '"' || c == '\'') {
+      if (p > run) buf_put(b, run, (size_t)(p - run));
+      switch (c) {
+        case '&': buf_puts(b, "&amp;"); break;
+        case '<': buf_puts(b, "&lt;"); break;
+        case '>': buf_puts(b, "&gt;"); break;
+        case '"': buf_puts(b, "&quot;"); break;
+        default: buf_puts(b, "&#39;"); break;
+      }
+      p++; run = p;
+    } else p++;
+  }
+  if (end > run) buf_put(b, run, (size_t)(end - run));
+}
+static void esc_html_buf(Buf *b, Str s) {
+  if (eng_use_avx2()) esc_html_buf_avx2(b, s); else esc_html_buf_sse2(b, s);
 }
 
 // slug contribution lookup: binary search in SLUG_TAB (sorted by cp).
@@ -1217,6 +1517,9 @@ typedef struct {
   // compiled ops (see templates section)
   void *ops; int nops;
   int parse_err; Str err_msg;
+  // constant-folded skeleton (NULL if not foldable); built per case after
+  // the case-constant values exist (see fold_build_all).
+  void *fold;
 } Template;
 typedef struct Build {
   Arena *arena;
@@ -1961,8 +2264,17 @@ static Value *scope_lookup(Scope *scope, Str *path, int npath, Arena *a) {
   // code scanned each scope twice: scope_has, then scope_get).
   Scope *s = scope;
   Value *v = NULL;
+#ifdef ENGINE_TEST_MAIN
+  c_lookup++;
+  uint64_t lk0 = rdtsc_now();
+#endif
   while (s) {
-    for (int i = s->n - 1; i >= 0; i--) if (str_eq(s->names[i], path[0])) { v = s->vals[i]; break; }
+    for (int i = s->n - 1; i >= 0; i--) {
+#ifdef ENGINE_TEST_MAIN
+      c_lookup_cmp++;
+#endif
+      if (str_eq(s->names[i], path[0])) { v = s->vals[i]; break; }
+    }
     if (v) break;
     s = s->parent;
   }
@@ -1975,9 +2287,18 @@ static Value *scope_lookup(Scope *scope, Str *path, int npath, Arena *a) {
       return NULL;
     }
     if (v->kind != V_OBJ) return NULL;
+#ifdef ENGINE_TEST_MAIN
+    uint64_t vf0 = rdtsc_now();
+#endif
     v = v_field(v, path[k]);
+#ifdef ENGINE_TEST_MAIN
+    cy_vfield += rdtsc_now() - vf0;
+#endif
     if (!v) return NULL;
   }
+#ifdef ENGINE_TEST_MAIN
+  cy_lookup += rdtsc_now() - lk0;
+#endif
   return v;
 }
 static void text_of_buf(Value *v, Buf *out, Arena *a) {
@@ -2020,11 +2341,380 @@ static int truthy_v(Value *v) {
 }
 static void render_range(Op *ops, int start, int end, Scope *scope, TmplCtx *tctx, int depth, Buf *out);
 
+// ---------------------------------------------------------------- constant folding (round 8)
+// A folded template is a skeleton of static segments + holes. Holes are
+// single-segment field reads on the per-render base objects (page/tag/p/
+// pager) whose field layout is fixed by this engine's constructors; the
+// field index is precomputed at fold time and verified by name at render
+// (mismatch falls back to v_field). Case-constant globals (site/tags/
+// recent) are baked into the static text at fold time. Templates with FOR,
+// INCLUDE, RAW on a hole base, or multi-segment dynamic paths are not
+// folded; they keep the interpreter (and the memo). A folded render that
+// meets an array/object hole value falls back to the interpreter for that
+// render (output built in a temp buffer, discarded on fallback).
+typedef struct { Str base; Str field; int field_idx; int esc; } FoldHole;
+typedef struct { Str root; Str field; int field_idx; int not; } FoldCond; // field.len==0: 1-seg truthiness of root
+typedef struct { Str text; int hole; int c0, c1; } FoldSeg; // cN: cond index or -1
+typedef struct { FoldSeg *segs; int nsegs; FoldHole *holes; int nholes; FoldCond *conds; int nconds; } Folded;
+
+// Precomputed field index for the engine's fixed object layouts, or -1.
+// page (page_of): title 0 url 1 date 2 date_long 3 summary 4 excerpt 5
+//   reading_minutes 6 tags 7 slug 8 content 9 toc 10 newer 11 older 12 is_post 13
+// tag (tag_of): name 0 slug 1 url 2 count 3 posts 4
+// p (card_of): title 0 url 1 date 2 date_long 3 summary 4 excerpt 5 reading_minutes 6 tags 7
+// pager: number 0 total 1 url 2 newer_url 3 older_url 4
+// site: title 0 base_url 1
+static int fold_field_idx(Str base, Str field) {
+  static const struct { const char *b; const char *f; int idx; } tab[] = {
+    {"page","title",0},{"page","url",1},{"page","date",2},{"page","date_long",3},
+    {"page","summary",4},{"page","excerpt",5},{"page","reading_minutes",6},{"page","tags",7},
+    {"page","slug",8},{"page","content",9},{"page","toc",10},{"page","newer",11},
+    {"page","older",12},{"page","is_post",13},
+    {"tag","name",0},{"tag","slug",1},{"tag","url",2},{"tag","count",3},{"tag","posts",4},
+    {"p","title",0},{"p","url",1},{"p","date",2},{"p","date_long",3},
+    {"p","summary",4},{"p","excerpt",5},{"p","reading_minutes",6},{"p","tags",7},
+    {"pager","number",0},{"pager","total",1},{"pager","url",2},{"pager","newer_url",3},{"pager","older_url",4},
+    {"site","title",0},{"site","base_url",1},
+  };
+  for (size_t i = 0; i < sizeof(tab)/sizeof(tab[0]); i++)
+    if (str_eq(base, str_from(tab[i].b)) && str_eq(field, str_from(tab[i].f))) return tab[i].idx;
+  return -1;
+}
+static int fold_is_hole_base(Str base) {
+  return str_eq(base, str_from("page")) || str_eq(base, str_from("tag")) ||
+         str_eq(base, str_from("p")) || str_eq(base, str_from("pager"));
+}
+static int fold_is_global(Str base) {
+  return str_eq(base, str_from("site")) || str_eq(base, str_from("tags")) ||
+         str_eq(base, str_from("recent"));
+}
+// Resolve a case-constant global path (site/tags/recent root) to a Value.
+static Value *fold_global_value(Build *b, Str *path, int npath) {
+  Value *v = NULL;
+  if (str_eq(path[0], str_from("site"))) v = b->site_v;
+  else if (str_eq(path[0], str_from("tags"))) v = b->tags_v;
+  else if (str_eq(path[0], str_from("recent"))) v = b->recent_v;
+  else return NULL;
+  for (int k = 1; k < npath; k++) {
+    if (!v) return NULL;
+    if (v->kind == V_ARR) {
+      // Only "length" is a valid path segment on an array (mirrors
+      // scope_lookup); without this, {{tags.length}} baked as missing.
+      if (str_eq(path[k], str_from("length"))) { v = v_num(b->arena, (int64_t)v->nitems); continue; }
+      return NULL;
+    }
+    if (v->kind != V_OBJ) return NULL;
+    v = v_field(v, path[k]);
+    if (!v) return NULL;
+  }
+  return v;
+}
+static void fold_emit_text(Arena *a, Folded *f, Buf *pend, int c0, int c1) {
+  if (pend->len == 0) return;
+  FoldSeg *s = &f->segs[f->nsegs++];
+  s->text.p = pend->buf; s->text.len = pend->len;
+  s->hole = -1; s->c0 = c0; s->c1 = c1;
+  buf_init(pend, a, 256);
+}
+// Build a folded skeleton for template t, or NULL if not foldable.
+// Runs per case after the case-constant values exist (step 7).
+static Folded *fold_build(Build *b, Template *t) {
+  Arena *a = b->arena;
+  Tmpl *tm = (Tmpl *)t->ops;
+  if (!tm || tm->nops == 0) return NULL;
+  Folded *f = arena_alloc(a, sizeof(Folded));
+  f->segs = arena_alloc(a, (size_t)(tm->nops + 2) * sizeof(FoldSeg));
+  f->holes = arena_alloc(a, (size_t)(tm->nops + 2) * sizeof(FoldHole));
+  f->conds = arena_alloc(a, (size_t)(tm->nops + 2) * sizeof(FoldCond));
+  f->nsegs = 0; f->nholes = 0; f->nconds = 0;
+  int cstack[2]; int sp = 0; // if-stack of cond indices (depth <= 2)
+  Buf pend; buf_init(&pend, a, 256);
+  for (int i = 0; i < tm->nops; i++) {
+    Op *op = &tm->ops[i];
+    int c0 = sp > 0 ? cstack[0] : -1, c1 = sp > 1 ? cstack[1] : -1;
+    switch (op->kind) {
+      case OP_TEXT: buf_put_str(&pend, op->text); break;
+      case OP_VAR:
+      case OP_RAW: {
+        if (op->npath != 2) return NULL;
+        if (fold_is_global(op->path[0])) {
+          Value *v = fold_global_value(b, op->path, op->npath);
+          if (!v) return NULL;
+          if (v->kind == V_STR) {
+            if (op->kind == OP_VAR) esc_html_buf(&pend, v->s);
+            else buf_put_str(&pend, v->s);
+          } else if (v->kind == V_NUM || v->kind == V_BOOL) {
+            Buf tmp; buf_init(&tmp, a, 32); text_of_buf(v, &tmp, a);
+            if (op->kind == OP_VAR) esc_html_buf(&pend, (Str){ tmp.buf, tmp.len });
+            else buf_put_str(&pend, (Str){ tmp.buf, tmp.len });
+          } else return NULL; // array/object global: not foldable
+          break;
+        }
+        if (!fold_is_hole_base(op->path[0])) return NULL;
+        if (op->kind == OP_RAW) return NULL; // raw holes not folded in P1a
+        fold_emit_text(a, f, &pend, c0, c1);
+        {
+          int hi = f->nholes++;
+          f->holes[hi].base = op->path[0];
+          f->holes[hi].field = op->path[1];
+          f->holes[hi].field_idx = fold_field_idx(op->path[0], op->path[1]);
+          f->holes[hi].esc = 1;
+          FoldSeg *s = &f->segs[f->nsegs++];
+          s->text.p = (const uint8_t *)""; s->text.len = 0;
+          s->hole = hi;
+          s->c0 = c0; s->c1 = c1;
+        }
+        break;
+      }
+      case OP_IF: {
+        if (op->npath < 1 || op->npath > 2) return NULL;
+        if (sp >= 2) return NULL;
+        fold_emit_text(a, f, &pend, c0, c1); // text before the if: outer conds
+        int ci = f->nconds++;
+        f->conds[ci].root = op->path[0];
+        if (op->npath == 2) {
+          f->conds[ci].field = op->path[1];
+          f->conds[ci].field_idx = fold_is_hole_base(op->path[0]) ? fold_field_idx(op->path[0], op->path[1]) : -1;
+        } else { f->conds[ci].field.p = NULL; f->conds[ci].field.len = 0; f->conds[ci].field_idx = -1; }
+        f->conds[ci].not = op->not;
+        cstack[sp++] = ci;
+        break;
+      }
+      case OP_ELSE: {
+        if (sp == 0) return NULL;
+        fold_emit_text(a, f, &pend, c0, c1); // then-branch text: if cond
+        int ci = f->nconds++;
+        int prev = cstack[sp - 1];
+        f->conds[ci] = f->conds[prev];
+        f->conds[ci].not = !f->conds[prev].not;
+        cstack[sp - 1] = ci;
+        break;
+      }
+      case OP_ENDIF: {
+        if (sp == 0) return NULL;
+        fold_emit_text(a, f, &pend, c0, c1); // branch text: if cond
+        sp--;
+        break;
+      }
+      default: return NULL; // FOR, INCLUDE, ENDFOR: not foldable
+    }
+  }
+  if (sp != 0) return NULL;
+  fold_emit_text(a, f, &pend, -1, -1);
+  if (f->nsegs == 0) return NULL;
+  return f;
+}
+static void fold_build_all(Build *b) {
+  for (int i = 0; i < b->ntemplates; i++) {
+    Template *t = &b->templates[i];
+    t->fold = NULL;
+    if (t->parse_err) continue;
+    t->fold = fold_build(b, t);
+#ifdef ENGINE_TEST_MAIN
+    if (t->fold) c_fold_templates++;
+#endif
+  }
+}
+// Base-object cache slots: 0 page, 1 tag, 2 p, 3 pager.
+static int fold_base_slot(Str base) {
+  static const char *bnames[4] = { "page", "tag", "p", "pager" };
+  for (int k = 0; k < 4; k++) if (str_eq(base, str_from(bnames[k]))) return k;
+  return -1;
+}
+static Value *fold_base_get(Str base, Scope *scope, TmplCtx *tctx, Value **cache) {
+  int bi = fold_base_slot(base);
+  if (bi >= 0) {
+    if (!cache[bi]) cache[bi] = scope_lookup(scope, &base, 1, tctx->b->arena);
+    return cache[bi];
+  }
+  return scope_lookup(scope, &base, 1, tctx->b->arena);
+}
+// Resolve a fold condition at render time. Returns 1 if it passes.
+static int fold_cond_ok(FoldCond *c, Scope *scope, TmplCtx *tctx, Value **cache) {
+  Arena *a = tctx->b->arena;
+  Value *v = NULL;
+  if (c->field.len == 0) {
+    v = scope_lookup(scope, &c->root, 1, a);
+  } else {
+    Value *base = fold_base_get(c->root, scope, tctx, cache);
+    if (!base) return c->not ? 1 : 0;
+    if (base->kind == V_ARR) {
+      // Only "length" is a valid path segment on an array (mirrors
+      // scope_lookup). v_field returns NULL for non-objects, so without
+      // this branch every {% if <array>.length %} folded to false.
+      if (str_eq(c->field, str_from("length"))) v = v_num(a, (int64_t)base->nitems);
+      else v = NULL;
+    } else if (c->field_idx >= 0 && (size_t)c->field_idx < base->nfields &&
+        base->kind == V_OBJ && str_eq(base->fields[c->field_idx].name, c->field))
+      v = base->fields[c->field_idx].v;
+    else v = v_field(base, c->field);
+  }
+  int ok = truthy_v(v);
+  return c->not ? !ok : ok;
+}
+// Render a folded template into out. Returns 1 on success, 0 to fall back
+// to the interpreter (out untouched: work goes to a temp buffer).
+static int fold_render(Folded *f, Scope *scope, TmplCtx *tctx, Buf *out) {
+  Arena *a = tctx->b->arena;
+  Buf tmp; buf_init(&tmp, a, 1024);
+  Value *cache[4] = { NULL, NULL, NULL, NULL };
+  for (int i = 0; i < f->nsegs; i++) {
+    FoldSeg *s = &f->segs[i];
+    if (s->c0 >= 0 && !fold_cond_ok(&f->conds[s->c0], scope, tctx, cache)) continue;
+    if (s->c1 >= 0 && !fold_cond_ok(&f->conds[s->c1], scope, tctx, cache)) continue;
+    if (s->text.len > 0) buf_put_str(&tmp, s->text);
+    if (s->hole >= 0) {
+      FoldHole *h = &f->holes[s->hole];
+      Value *base = fold_base_get(h->base, scope, tctx, cache);
+      if (!base) continue; // missing base: interpreter emits ""
+      Value *v = NULL;
+      if (h->field_idx >= 0 && (size_t)h->field_idx < base->nfields &&
+          base->kind == V_OBJ && str_eq(base->fields[h->field_idx].name, h->field))
+        v = base->fields[h->field_idx].v;
+      else v = v_field(base, h->field);
+      if (!v) continue;
+      if (v->kind == V_ARR || v->kind == V_OBJ) return 0; // fall back
+      if (v->kind == V_STR) {
+        if (h->esc) esc_html_buf(&tmp, v->s);
+        else buf_put_str(&tmp, v->s);
+      } else {
+        Buf tv; buf_init(&tv, a, 32); text_of_buf(v, &tv, a);
+        if (h->esc) esc_html_buf(&tmp, (Str){ tv.buf, tv.len });
+        else buf_put_str(&tmp, (Str){ tv.buf, tv.len });
+      }
+    }
+  }
+  buf_put_str(out, (Str){ tmp.buf, tmp.len });
+  return 1;
+}
+
+// ---------------------------------------------------------------- include inlining (round 8)
+// Inline non-cacheable includes into the caller's op stream at fold time
+// (after the skeletons are built, so folded targets keep their fast path).
+// Semantics-preserving by construction: an include renders the sub-template
+// in the caller's scope, which is exactly what spliced ops do.
+static Op *fold_inline_ops(Build *b, Tmpl *tm, int depth, Template **visiting, int nvis, int *nout);
+static int fold_memo_would_serve(Build *b, Template *t, uint64_t bound_mask) {
+  if (!t || t->parse_err) return 0;
+  TmplAnalysis an = memo_analyze((Tmpl *)t->ops, bound_mask, 0, &b->template_map);
+  if (an.bad) return 0;
+  int id_loop = memo_id_of_cstr("loop");
+  int id_site = memo_id_of_cstr("site");
+  int id_tags = memo_id_of_cstr("tags");
+  int id_recent = memo_id_of_cstr("recent");
+  if (id_loop < 0 || id_site < 0 || id_tags < 0 || id_recent < 0) return 0;
+  uint64_t globals = (1ULL << id_site) | (1ULL << id_tags) | (1ULL << id_recent);
+  if (an.free_mask & ~globals) return 0;
+  if (an.outer_mask & (1ULL << id_loop)) return 0;
+  int ndep = 0;
+  for (int id = 0; id < MEMO_MAX_NAMES; id++) if (an.outer_mask & (1ULL << id)) ndep++;
+  if (ndep > 4) return 0;
+  return 1;
+}
+static Op *fold_inline_ops(Build *b, Tmpl *tm, int depth, Template **visiting, int nvis, int *nout);
+// OutOp: an op being spliced, with its origin for jump remapping.
+// jump_base >= 0: the op came from a spliced block starting at that output
+// position, and its jump is a sub-array index (target = base + jump).
+// jump_base == -1: the op is one of tm's own; its jump is a tm source index.
+typedef struct { Op op; Tmpl *src; int src_idx; int jump_base; } FoldOutOp;
+static Op *fold_inline_ops(Build *b, Tmpl *tm, int depth, Template **visiting, int nvis, int *nout) {
+  Arena *a = b->arena;
+  // Pass 1: build the OutOp list (caller ops in order + spliced blocks).
+  // Total output is capped at 1024 ops (checked on splice).
+  FoldOutOp *oo = arena_alloc(a, (size_t)(tm->nops + 2048) * sizeof(FoldOutOp));
+  int n = 0;
+  uint64_t own_stack[16];
+  int own_sp = 0;
+  uint64_t own_mask = 0;
+  for (int i = 0; i < tm->nops; i++) {
+    Op *op = &tm->ops[i];
+    if (op->kind == OP_FOR) {
+      int vid = memo_name_id(op->varname);
+      int lid = memo_id_of_cstr("loop");
+      if (vid >= 0 && lid >= 0) {
+        if (own_sp < 16) own_stack[own_sp++] = own_mask;
+        own_mask |= (1ULL << vid) | (1ULL << lid);
+      }
+      oo[n].op = *op; oo[n].src = tm; oo[n].src_idx = i; oo[n].jump_base = -1; n++;
+      continue;
+    }
+    if (op->kind == OP_ENDFOR) {
+      if (own_sp > 0) own_mask = own_stack[--own_sp];
+      oo[n].op = *op; oo[n].src = tm; oo[n].src_idx = i; oo[n].jump_base = -1; n++;
+      continue;
+    }
+    if (op->kind == OP_INCLUDE && depth < 8) {
+      Template *t = hmap_get(&b->template_map, op->incname);
+      int cyclic = 0;
+      if (t) for (int k = 0; k < nvis; k++) if (visiting[k] == t) cyclic = 1;
+      if (t && !t->parse_err && !cyclic && !t->fold &&
+          !fold_memo_would_serve(b, t, own_mask)) {
+        Template *vis2[16];
+        int nv = nvis < 16 ? nvis : 16;
+        for (int k = 0; k < nv; k++) vis2[k] = visiting[k];
+        if (nv < 16) vis2[nv++] = t;
+        int subn = 0;
+        Op *sub = fold_inline_ops(b, (Tmpl *)t->ops, depth + 1, vis2, nv, &subn);
+        if (sub && n + subn <= 1024) {
+          int base = n;
+#ifdef ENGINE_TEST_MAIN
+          c_inline_splices++;
+#endif
+          for (int k = 0; k < subn; k++) {
+            oo[n].op = sub[k]; oo[n].src = NULL; oo[n].src_idx = -1; oo[n].jump_base = base; n++;
+          }
+          continue;
+        }
+      }
+      oo[n].op = *op; oo[n].src = tm; oo[n].src_idx = i; oo[n].jump_base = -1; n++;
+      continue;
+    }
+    oo[n].op = *op; oo[n].src = tm; oo[n].src_idx = i; oo[n].jump_base = -1; n++;
+  }
+  // Pass 2: remap jumps to output positions. Caller ops' jumps are tm
+  // source indices (all jumps point forward at control ops, which are
+  // never spliced away); spliced ops' jumps are sub-array indices.
+  int *cmap = arena_alloc(a, (size_t)(tm->nops > 0 ? tm->nops : 1) * sizeof(int));
+  for (int i = 0; i < tm->nops; i++) cmap[i] = -1;
+  for (int k = 0; k < n; k++) if (oo[k].src == tm) cmap[oo[k].src_idx] = k;
+  for (int k = 0; k < n; k++) {
+    // Only IF/ELSE/FOR carry a jump; other ops leave it unset (garbage).
+    if (oo[k].op.kind != OP_IF && oo[k].op.kind != OP_ELSE && oo[k].op.kind != OP_FOR) continue;
+    if (oo[k].op.jump < 0) continue;
+    if (oo[k].jump_base >= 0) { oo[k].op.jump += oo[k].jump_base; continue; }
+    if (oo[k].op.jump >= tm->nops) return NULL; // corrupt: do not inline
+    int tgt = cmap[oo[k].op.jump];
+    if (tgt < 0) return NULL; // jump target spliced away: do not inline
+    oo[k].op.jump = tgt;
+  }
+  Op *out = arena_alloc(a, (size_t)(n > 0 ? n : 1) * sizeof(Op));
+  for (int k = 0; k < n; k++) out[k] = oo[k].op;
+  *nout = n;
+  return out;
+}
+static void fold_inline_all(Build *b) {
+  for (int i = 0; i < b->ntemplates; i++) {
+    Template *t = &b->templates[i];
+    if (t->parse_err) continue;
+    Template *vis[1] = { t };
+    int nout = 0;
+    Op *ops = fold_inline_ops(b, (Tmpl *)t->ops, 0, vis, 1, &nout);
+    if (ops) { ((Tmpl *)t->ops)->ops = ops; ((Tmpl *)t->ops)->nops = nout; }
+  }
+  // analyses were computed on pre-inline ops; clear the cache so renders
+  // analyze the final op streams.
+  for (int i = 0; i < MEMO_ANALYSIS_SLOTS; i++) g_memo_analysis[i].valid = 0;
+}
+
 // Try to serve an {% include %} from the render memo. Returns 1 if the
 // include was rendered (hit or miss-stored) and appended to out, 0 if the
 // caller must render it normally (not cacheable).
 static int memo_include(Tmpl *tm, Template *t, Scope *scope, TmplCtx *tctx, int depth, Buf *out) {
   Arena *a = tctx->b->arena;
+#ifdef ENGINE_TEST_MAIN
+  c_memo_call++;
+  uint64_t mk0 = rdtsc_now();
+#endif
   // Bound names at this render point: the loop variables on the scope chain.
   // A for-loop frame has exactly 2 names, the second being "loop".
   uint64_t bound_mask = 0;
@@ -2037,22 +2727,47 @@ static int memo_include(Tmpl *tm, Template *t, Scope *scope, TmplCtx *tctx, int 
     }
   }
   TmplAnalysis *an = memo_analysis_for(tm, bound_mask, &tctx->b->template_map);
-  if (!an || an->bad) return 0;
+  if (!an || an->bad) {
+#ifdef ENGINE_TEST_MAIN
+    c_memo_r0_analysis++; cy_memo_setup += rdtsc_now() - mk0;
+#endif
+    return 0;
+  }
   int id_site = memo_id_of_cstr("site");
   int id_tags = memo_id_of_cstr("tags");
   int id_recent = memo_id_of_cstr("recent");
   int id_loop = memo_id_of_cstr("loop");
   if (id_site < 0 || id_tags < 0 || id_recent < 0 || id_loop < 0) return 0;
   uint64_t globals = (1ULL << id_site) | (1ULL << id_tags) | (1ULL << id_recent);
-  if (an->free_mask & ~globals) return 0; // reads a per-render name (page, ...)
-  if (an->outer_mask & (1ULL << id_loop)) return 0; // reads the mutating loop object
+  if (an->free_mask & ~globals) {
+#ifdef ENGINE_TEST_MAIN
+    c_memo_r0_free++; cy_memo_setup += rdtsc_now() - mk0;
+#endif
+    return 0; // reads a per-render name (page, ...)
+  }
+  if (an->outer_mask & (1ULL << id_loop)) {
+#ifdef ENGINE_TEST_MAIN
+    c_memo_r0_loop++; cy_memo_setup += rdtsc_now() - mk0;
+#endif
+    return 0; // reads the mutating loop object
+  }
   Value *dep[4];
   int ndep = 0;
   for (int id = 0; id < MEMO_MAX_NAMES; id++) {
     if (!(an->outer_mask & (1ULL << id))) continue;
-    if (ndep >= 4) return 0;
+    if (ndep >= 4) {
+#ifdef ENGINE_TEST_MAIN
+      c_memo_r0_ndep++; cy_memo_setup += rdtsc_now() - mk0;
+#endif
+      return 0;
+    }
     Value *v = scope_lookup(scope, &g_memo_names[id], 1, a);
-    if (!v) return 0;
+    if (!v) {
+#ifdef ENGINE_TEST_MAIN
+      c_memo_r0_depnull++; cy_memo_setup += rdtsc_now() - mk0;
+#endif
+      return 0;
+    }
     dep[ndep++] = v;
   }
   uint64_t h = (uint64_t)(uintptr_t)t * 1099511628211ULL;
@@ -2061,8 +2776,15 @@ static int memo_include(Tmpl *tm, Template *t, Scope *scope, TmplCtx *tctx, int 
   for (int probe = 0; probe < MEMO_SLOTS; probe++) {
     MemoSlot *m = &g_memo[(slot + probe) & (MEMO_SLOTS - 1)];
     if (m->gen != g_memo_gen) {
+#ifdef ENGINE_TEST_MAIN
+      uint64_t mr0 = rdtsc_now();
+      cy_memo_setup += mr0 - mk0;
+#endif
       Buf tmp; buf_init(&tmp, a, 1024);
       render_range(tm->ops, 0, tm->nops, scope, tctx, depth + 1, &tmp);
+#ifdef ENGINE_TEST_MAIN
+      cy_memo_missrender += rdtsc_now() - mr0;
+#endif
       m->gen = g_memo_gen; m->tm = t; m->ndep = ndep;
       for (int i = 0; i < ndep; i++) m->dep[i] = dep[i];
       m->html.p = tmp.buf; m->html.len = tmp.len;
@@ -2073,7 +2795,12 @@ static int memo_include(Tmpl *tm, Template *t, Scope *scope, TmplCtx *tctx, int 
     if (m->tm == t && m->ndep == ndep) {
       int eq = 1;
       for (int i = 0; i < ndep; i++) if (m->dep[i] != dep[i]) { eq = 0; break; }
-      if (eq) { g_memo_hits++; buf_put_str(out, m->html); return 1; }
+      if (eq) {
+#ifdef ENGINE_TEST_MAIN
+        cy_memo_hit += rdtsc_now() - mk0;
+#endif
+        g_memo_hits++; buf_put_str(out, m->html); return 1;
+      }
     }
   }
   return 0; // memo table full: render normally
@@ -2081,23 +2808,43 @@ static int memo_include(Tmpl *tm, Template *t, Scope *scope, TmplCtx *tctx, int 
 
 static void render_range(Op *ops, int start, int end, Scope *scope, TmplCtx *tctx, int depth, Buf *out) {
   Arena *a = tctx->b->arena;
+#ifdef ENGINE_TEST_MAIN
+  c_render_range++;
+#endif
   for (int i = start; i < end; i++) {
     Op *op = &ops[i];
     switch (op->kind) {
-      case OP_TEXT: buf_put_str(out, op->text); break;
+      case OP_TEXT: buf_put_str(out, op->text);
+#ifdef ENGINE_TEST_MAIN
+        c_op_text++; c_text_bytes += op->text.len;
+#endif
+        break;
       case OP_VAR: {
+#ifdef ENGINE_TEST_MAIN
+        c_op_var++;
+        uint64_t es0 = rdtsc_now();
+#endif
         Value *v = scope_lookup(scope, op->path, op->npath, a);
         if (v && v->kind == V_STR) esc_html_buf(out, v->s);
         else { Buf tmp; buf_init(&tmp, a, 64); text_of_buf(v, &tmp, a); esc_html_buf(out, (Str){ tmp.buf, tmp.len }); }
+#ifdef ENGINE_TEST_MAIN
+        cy_esc += rdtsc_now() - es0;
+#endif
         break;
       }
       case OP_RAW: {
+#ifdef ENGINE_TEST_MAIN
+        c_op_raw++;
+#endif
         Value *v = scope_lookup(scope, op->path, op->npath, a);
         if (v && v->kind == V_STR) buf_put_str(out, v->s);
         else text_of_buf(v, out, a);
         break;
       }
       case OP_IF: {
+#ifdef ENGINE_TEST_MAIN
+        c_op_if++;
+#endif
         Value *v = scope_lookup(scope, op->path, op->npath, a);
         int tv = truthy_v(v);
         int take_then = (tv != op->not);
@@ -2113,6 +2860,10 @@ static void render_range(Op *ops, int start, int end, Scope *scope, TmplCtx *tct
         break;
       }
       case OP_FOR: {
+#ifdef ENGINE_TEST_MAIN
+        c_op_for++;
+        uint64_t fs0 = rdtsc_now();
+#endif
         Value *v = scope_lookup(scope, op->path, op->npath, a);
         if (v && v->kind == V_ARR) {
           // mutable loop object, shared across iterations
@@ -2124,6 +2875,9 @@ static void render_range(Op *ops, int start, int end, Scope *scope, TmplCtx *tct
           lf[2].name = str_from("last"); lf[2].v = lv_last;
           lf[3].name = str_from("length"); lf[3].v = lv_length;
           loop->fields = lf; loop->nfields = 4;
+#ifdef ENGINE_TEST_MAIN
+          cy_for_setup += rdtsc_now() - fs0;
+#endif
           Str names[2]; Value *vals[2];
           names[0] = op->varname; vals[0] = NULL;
           names[1] = str_from("loop"); vals[1] = loop;
@@ -2140,10 +2894,22 @@ static void render_range(Op *ops, int start, int end, Scope *scope, TmplCtx *tct
         break;
       }
       case OP_INCLUDE: {
+#ifdef ENGINE_TEST_MAIN
+        c_op_inc++;
+#endif
         if (depth < 8) {
           Template *t = hmap_get(&tctx->b->template_map, op->incname);
           if (t && !t->parse_err) {
             Tmpl *tm = (Tmpl *)t->ops;
+            if (t->fold) {
+#ifdef ENGINE_TEST_MAIN
+              c_fold_renders++;
+#endif
+              if (fold_render((Folded *)t->fold, scope, tctx, out)) break;
+#ifdef ENGINE_TEST_MAIN
+              c_fold_fallback++;
+#endif
+            }
             if (!memo_include(tm, t, scope, tctx, depth, out))
               render_range(tm->ops, 0, tm->nops, scope, tctx, depth + 1, out);
           }
@@ -2169,6 +2935,9 @@ static int render_named(Build *b, Str name, Str *varnames, Value **varvals, int 
   Scope scope; scope.names = names; scope.vals = vals; scope.n = total; scope.parent = NULL;
   Tmpl *tm = (Tmpl *)t->ops;
   TmplCtx tctx = { b };
+#ifdef ENGINE_TEST_MAIN
+  c_render_named++;
+#endif
   render_range(tm->ops, 0, tm->nops, &scope, &tctx, 0, out);
   return 1;
 }
@@ -2343,7 +3112,7 @@ static void build_case(Input *in, Arena *a, Build *b) {
     Template *t = &b->templates[i];
     t->name = in->templates[i].name; t->src = in->templates[i].src;
     Tmpl *tm = arena_alloc(a, sizeof(Tmpl));
-    t->ops = tm;
+    t->ops = tm; t->fold = NULL;
     if (!parse_template(t->name, t->src, a, tm)) {
       t->parse_err = 1; t->err_msg = tm->err_msg;
       build_report(b, tm->err_msg);
@@ -2640,6 +3409,11 @@ static void build_case(Input *in, Arena *a, Build *b) {
     for (int i = 0; i < rn; i++) recentVals[i] = card_of(b, posts[i]);
     b->recent_v = v_arr(a, recentVals, (size_t)rn);
   }
+  // round 8: constant-fold small templates (skeletons + holes) and inline
+  // non-cacheable includes into their callers. Both run after the
+  // case-constant values exist; skeletons first so inlining keeps them.
+  fold_build_all(b);
+  fold_inline_all(b);
   STEP_END(); STEP_BEGIN(8);
   // 7. layouts
   for (int i = 0; i < nkept; i++) {
@@ -3057,6 +3831,44 @@ static int cmd_build(int argc, char **argv) {
   write_all(1, out.buf, out.len);
   return 0;
 }
+static int cmd_prof(int argc, char **argv) {
+  if (argc < 3) tm_die("usage: engine_test prof <cases.json>\n");
+  size_t len; uint8_t *data = map_file(argv[2], &len);
+  if (!data) tm_die("prof: cannot map cases.json\n");
+  Arena arena; arena_init(&arena, 256 << 20);
+  Buf out; buf_init(&out, &arena, 1 << 20);
+  int64_t t0 = tm_now_us();
+  uint64_t c0 = rdtsc_now();
+  int n = run_cases(data, len, &arena, &out);
+  int64_t t1 = tm_now_us();
+  uint64_t c1 = rdtsc_now();
+  if (n < 0) tm_die("prof: parse failed\n");
+  // cycles per microsecond (calibrated on this run)
+  uint64_t cyc_per_us = (c1 > c0 && t1 > t0) ? (c1 - c0) / (uint64_t)(t1 - t0) : 3000;
+  write_all(2, (const uint8_t *)"--- prof ---\n", 13);
+  Arena oa; arena_init(&oa, 1 << 20);
+  Buf ob; buf_init(&ob, &oa, 4096);
+  buf_puts(&ob, "wall_us: "); tm_put_u64(&ob, (uint64_t)(t1 - t0)); buf_puts(&ob, "\n");
+  buf_puts(&ob, "render_named: "); tm_put_u64(&ob, c_render_named); buf_puts(&ob, "\n");
+  buf_puts(&ob, "render_range calls: "); tm_put_u64(&ob, c_render_range); buf_puts(&ob, "\n");
+  buf_puts(&ob, "OP_TEXT: "); tm_put_u64(&ob, c_op_text); buf_puts(&ob, " bytes: "); tm_put_u64(&ob, c_text_bytes); buf_puts(&ob, "\n");
+  buf_puts(&ob, "OP_VAR: "); tm_put_u64(&ob, c_op_var); buf_puts(&ob, "\n");
+  buf_puts(&ob, "OP_RAW: "); tm_put_u64(&ob, c_op_raw); buf_puts(&ob, "\n");
+  buf_puts(&ob, "OP_IF: "); tm_put_u64(&ob, c_op_if); buf_puts(&ob, "\n");
+  buf_puts(&ob, "OP_FOR: "); tm_put_u64(&ob, c_op_for); buf_puts(&ob, "\n");
+  buf_puts(&ob, "OP_INCLUDE: "); tm_put_u64(&ob, c_op_inc); buf_puts(&ob, "\n");
+  buf_puts(&ob, "scope_lookup calls: "); tm_put_u64(&ob, c_lookup); buf_puts(&ob, " name-cmps: "); tm_put_u64(&ob, c_lookup_cmp); buf_puts(&ob, "\n");
+  buf_puts(&ob, "memo_include calls: "); tm_put_u64(&ob, c_memo_call); buf_puts(&ob, " hits: "); tm_put_u64(&ob, g_memo_hits); buf_puts(&ob, " miss: "); tm_put_u64(&ob, g_memo_miss); buf_puts(&ob, " nocache: "); tm_put_u64(&ob, g_memo_nocache); buf_puts(&ob, "\n");
+  buf_puts(&ob, "memo r0: analysis="); tm_put_u64(&ob, c_memo_r0_analysis); buf_puts(&ob, " free="); tm_put_u64(&ob, c_memo_r0_free); buf_puts(&ob, " loop="); tm_put_u64(&ob, c_memo_r0_loop); buf_puts(&ob, " ndep="); tm_put_u64(&ob, c_memo_r0_ndep); buf_puts(&ob, " depnull="); tm_put_u64(&ob, c_memo_r0_depnull); buf_puts(&ob, "\n");
+  buf_puts(&ob, "fold templates: "); tm_put_u64(&ob, c_fold_templates); buf_puts(&ob, " fold renders: "); tm_put_u64(&ob, c_fold_renders); buf_puts(&ob, " fallback: "); tm_put_u64(&ob, c_fold_fallback); buf_puts(&ob, " inline splices: "); tm_put_u64(&ob, c_inline_splices); buf_puts(&ob, "\n");
+  buf_puts(&ob, "cyc_per_us: "); tm_put_u64(&ob, cyc_per_us); buf_puts(&ob, "\n");
+  buf_puts(&ob, "cy_lookup us: "); tm_put_u64(&ob, cy_lookup / cyc_per_us); buf_puts(&ob, " (vfield: "); tm_put_u64(&ob, cy_vfield / cyc_per_us); buf_puts(&ob, ")\n");
+  buf_puts(&ob, "cy_memo_setup us: "); tm_put_u64(&ob, cy_memo_setup / cyc_per_us); buf_puts(&ob, " hit: "); tm_put_u64(&ob, cy_memo_hit / cyc_per_us); buf_puts(&ob, " missrender: "); tm_put_u64(&ob, cy_memo_missrender / cyc_per_us); buf_puts(&ob, "\n");
+  buf_puts(&ob, "cy_esc us: "); tm_put_u64(&ob, cy_esc / cyc_per_us); buf_puts(&ob, " for_setup: "); tm_put_u64(&ob, cy_for_setup / cyc_per_us); buf_puts(&ob, "\n");
+  buf_puts(&ob, "out_bytes: "); tm_put_u64(&ob, out.len); buf_puts(&ob, "\n");
+  write_all(2, ob.buf, ob.len);
+  return 0;
+}
 
 static int cmd_bench(int argc, char **argv) {
   if (argc < 4) tm_die("usage: engine_test bench <cases.json> <iters>\n");
@@ -3289,6 +4101,7 @@ int main(int argc, char **argv) {
   if (argc < 2) { write_all(2, (const uint8_t *)"usage: engine_test <md|build|bench> ...\n", 37); return 1; }
   if (__builtin_strcmp(argv[1], "md") == 0) return cmd_md(argc, argv);
   if (__builtin_strcmp(argv[1], "build") == 0) return cmd_build(argc, argv);
+  if (__builtin_strcmp(argv[1], "prof") == 0) return cmd_prof(argc, argv);
   if (__builtin_strcmp(argv[1], "bench") == 0) return cmd_bench(argc, argv);
   if (__builtin_strcmp(argv[1], "dump") == 0) return cmd_dump(argc, argv);
   if (__builtin_strcmp(argv[1], "benchstages") == 0) return cmd_benchstages(argc, argv);
