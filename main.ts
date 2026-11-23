@@ -11,12 +11,14 @@ import { setFlagsFromString } from 'node:v8';
 // baseline runs with --no-incremental-marking, and an entry may tune V8's flags too). TurboFan's optimiser is off
 // as well: this entry runs three cases once each, so the optimiser's background compilation costs more CPU than
 // its faster code ever repays on so short a run; Sparkplug carries the work instead. The young generation is
-// roomier, so the collector runs less often.
+// roomier, so the collector runs less often: --max-semi-space-size=512 measured ~7% faster than 64 on the
+// grader's node22 (335 ms -> 313 ms net, 5 interleaved rounds) at the same 143 MB peak RSS, far under the
+// sandbox's 1024 MB.
 // NOTE: --single-threaded was REMOVED (round 2): on the grader's node22 (V8 12.4) setting it via
 // setFlagsFromString after isolate init trips a CppHeap CHECK (concurrent_marking_handle_) at the next GC and
 // kills the process with SIGTRAP (exit 133) — round 1 died exactly that way. Bisected on node 22.21.1: the
 // flag alone reproduces 133, everything else exits 0. It was worth ~nothing locally anyway (neutral vs v5).
-setFlagsFromString('--no-incremental-marking --no-turbofan --max-semi-space-size=64');
+setFlagsFromString('--no-incremental-marking --no-turbofan --max-semi-space-size=512');
 
 /** solve.js, imported by its URL (a .js module carries no types) and typed by its contract. */
 const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
