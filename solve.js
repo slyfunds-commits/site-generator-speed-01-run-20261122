@@ -257,87 +257,94 @@ function isBlank(line) {
   return true;
 }
 
-/** A fence-open line's language, or null. */
-function fenceOpen(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
-  let j = 3;
-  while (j < line.length) {
-    const c = line.charCodeAt(j);
+const CONTINUED = /^ {2,}\S/;
+
+/** Range helpers for the single-pass renderer: lines are ranges [a, b) of `src`, classified once and consumed exactly once. No split(), no per-line kind cache. */
+function isBlankRange(s, a, b) {
+  for (let k = a; k < b; k++) { const c = s.charCodeAt(k); if (c !== 32 && c !== 9) return false; }
+  return true;
+}
+function fenceOpenRange(s, a, b) {
+  if (s.charCodeAt(a) !== 96 || s.charCodeAt(a + 1) !== 96 || s.charCodeAt(a + 2) !== 96) return null;
+  let j = a + 3;
+  while (j < b) {
+    const c = s.charCodeAt(j);
     if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) j++;
     else break;
   }
-  const lang = line.slice(3, j);
-  while (j < line.length && (line.charCodeAt(j) === 32 || line.charCodeAt(j) === 9)) j++;
-  return j === line.length ? lang : null;
+  const lang = s.slice(a + 3, j);
+  while (j < b && (s.charCodeAt(j) === 32 || s.charCodeAt(j) === 9)) j++;
+  return j === b ? lang : null;
 }
-
-/** Whether `line` closes a fence. */
-function isFenceClose(line) {
-  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
-  for (let k = 3; k < line.length; k++) {
-    const c = line.charCodeAt(k);
-    if (c !== 32 && c !== 9) return false;
-  }
+function isFenceCloseRange(s, a, b) {
+  if (s.charCodeAt(a) !== 96 || s.charCodeAt(a + 1) !== 96 || s.charCodeAt(a + 2) !== 96) return false;
+  for (let k = a + 3; k < b; k++) { const c = s.charCodeAt(k); if (c !== 32 && c !== 9) return false; }
   return true;
 }
-
-/** A heading line's level and text, or null. */
-function headingOf(line) {
+function headingRange(s, a, b) {
   let d = 0;
-  while (d < line.length && line.charCodeAt(d) === 35) d++;
-  if (d === 0 || d > 6 || d >= line.length) return null;
-  const c = line.charCodeAt(d);
+  while (a + d < b && s.charCodeAt(a + d) === 35) d++;
+  if (d === 0 || d > 6 || a + d >= b) return null;
+  const c = s.charCodeAt(a + d);
   if (c !== 32 && c !== 9) return null;
-  let s = d;
-  while (s < line.length && (line.charCodeAt(s) === 32 || line.charCodeAt(s) === 9)) s++;
-  let e = line.length;
-  while (e > s && (line.charCodeAt(e - 1) === 32 || line.charCodeAt(e - 1) === 9)) e--;
-  if (e <= s) return null;
-  return { depth: d, text: line.slice(s, e) };
+  let st = a + d;
+  while (st < b && (s.charCodeAt(st) === 32 || s.charCodeAt(st) === 9)) st++;
+  let e = b;
+  while (e > st && (s.charCodeAt(e - 1) === 32 || s.charCodeAt(e - 1) === 9)) e--;
+  if (e <= st) return null;
+  return { depth: d, text: s.slice(st, e) };
 }
-
-/** Whether `line` is a thematic break. */
-function isHR(line) {
-  const c = line.charCodeAt(0);
+function isHRRange(s, a, b) {
+  const c = s.charCodeAt(a);
   if (c !== 45 && c !== 42) return false;
-  if (line.charCodeAt(1) !== c || line.charCodeAt(2) !== c) return false;
-  for (let k = 3; k < line.length; k++) {
-    const cc = line.charCodeAt(k);
-    if (cc !== 32 && cc !== 9) return false;
-  }
+  if (s.charCodeAt(a + 1) !== c || s.charCodeAt(a + 2) !== c) return false;
+  for (let k = a + 3; k < b; k++) { const cc = s.charCodeAt(k); if (cc !== 32 && cc !== 9) return false; }
   return true;
 }
-
-/** A paragraph line as rendered: spaces and tabs at either end dropped. */
-function trimLine(line) {
-  let a = 0;
-  let b = line.length;
-  while (a < b && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
-  while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
-  return line.slice(a, b);
-}
-
-/**
- * A list's first line, or null: { ordered, start, text }. A bullet list
- * opens on "- " or "* "; an ordered list on 1-9 digits and ". ".
- */
-function listStart(line) {
-  const c0 = line.charCodeAt(0);
+function listStartRange(s, a, b) {
+  const c0 = s.charCodeAt(a);
   if (c0 === 45 || c0 === 42) {
-    if (line.charCodeAt(1) === 32) return { ordered: false, start: 1, text: line.slice(2) };
+    if (s.charCodeAt(a + 1) === 32) return { ordered: false, start: 1, text: s.slice(a + 2, b) };
     return null;
   }
   if (c0 >= 48 && c0 <= 57) {
-    let j = 0;
-    while (j < line.length && line.charCodeAt(j) >= 48 && line.charCodeAt(j) <= 57) j++;
-    if (j >= 1 && j <= 9 && line.charCodeAt(j) === 46 && line.charCodeAt(j + 1) === 32) {
-      return { ordered: true, start: Number(line.slice(0, j)), text: line.slice(j + 2) };
+    let j = a;
+    while (j < b && s.charCodeAt(j) >= 48 && s.charCodeAt(j) <= 57) j++;
+    if (j - a >= 1 && j - a <= 9 && s.charCodeAt(j) === 46 && s.charCodeAt(j + 1) === 32) {
+      return { ordered: true, start: Number(s.slice(a, j)), text: s.slice(j + 2, b) };
     }
   }
   return null;
 }
+function trimRange(s, a, b) {
+  while (a < b && (s.charCodeAt(a) === 32 || s.charCodeAt(a) === 9)) a++;
+  while (b > a && (s.charCodeAt(b - 1) === 32 || s.charCodeAt(b - 1) === 9)) b--;
+  return [a, b];
+}
 
-const CONTINUED = /^ {2,}\S/;
+/** Classify line [a,b): returns [kind, payload]; kinds: 1 blank, 2 fence, 3 heading, 4 hr, 5 quote, 6 list, 7 other. */
+function classify(s, a, b) {
+  if (a === b) return [1, null];
+  // blank check (full scan, but early-exits on first non-blank char)
+  let blank = true;
+  for (let k = a; k < b; k++) { const c = s.charCodeAt(k); if (c !== 32 && c !== 9) { blank = false; break; } }
+  if (blank) return [1, null];
+  const c0 = s.charCodeAt(a);
+  if (c0 === 96) {
+    const lang = fenceOpenRange(s, a, b);
+    if (lang !== null) return [2, lang];
+  } else if (c0 === 35) {
+    const h = headingRange(s, a, b);
+    if (h !== null) return [3, h];
+  } else if (c0 === 45 || c0 === 42) {
+    if (isHRRange(s, a, b)) return [4, null];
+  } else if (c0 === 62) {
+    return [5, null];
+  }
+  const ls = listStartRange(s, a, b);
+  if (ls !== null) return [6, ls];
+  return [7, null];
+}
 
 const FIND_DOUBLE_STAR = /\*\*/g;
 const FIND_BRACKET = /\]/g;
@@ -508,112 +515,79 @@ export function inline(s, env) {
   return out.join('');
 }
 
-/**
- * `src` rendered: its HTML, its table of contents (level 2 and 3 headings)
- * and its excerpt (the first paragraph's inline HTML, or ""). Blocks render
- * straight into one output array; only headings (whose HTML the toc also
- * needs) and the first paragraph (the excerpt) are built as strings.
- */
 export function renderMarkdown(src, env) {
-  const lines = src.split('\n');
-  const n = lines.length;
-  // Each line's block kind, classified once and cached: a line is examined
-  // as the next line of a paragraph and again as a block start, and list
-  // lines are examined by listStart twice more; the cache pays the
-  // classification (isBlank's full scan, headingOf, fenceOpen, isHR,
-  // listStart) once per line. Kinds: 1 blank, 2 fence, 3 heading, 4 break,
-  // 5 quote, 6 list, 7 other; 0 means unclassified. `pay` holds a fence's
-  // language, a heading's {depth, text} or a list's {ordered, start, text}.
-  const kinds = new Uint8Array(n);
-  const pay = new Array(n);
-  const kindOf = (li) => {
-    const cached = kinds[li];
-    if (cached !== 0) return cached;
-    const line = lines[li];
-    let k;
-    if (isBlank(line)) k = 1;
-    else {
-      const c0 = line.charCodeAt(0);
-      if (c0 === 96) {
-        const lang = fenceOpen(line);
-        if (lang !== null) {
-          pay[li] = lang;
-          k = 2;
-        }
-      } else if (c0 === 35) {
-        const h = headingOf(line);
-        if (h !== null) {
-          pay[li] = h;
-          k = 3;
-        }
-      } else if (c0 === 45 || c0 === 42) {
-        if (isHR(line)) k = 4;
-      } else if (c0 === 62) {
-        k = 5;
-      }
-      if (k === undefined) {
-        const ls = listStart(line);
-        if (ls !== null) {
-          pay[li] = ls;
-          k = 6;
-        } else k = 7;
-      }
-    }
-    kinds[li] = k;
-    return k;
-  };
   const parts = [];
   const toc = [];
   const ids = new Set();
   let excerpt = null;
-  let i = 0;
-  while (i < n) {
-    const k = kindOf(i);
-    if (k === 1) {
-      i++;
-      continue;
-    }
+  const N = src.length;
+  let pos = 0;
+  // lineEnd(p): end index (excl '\n') of the line starting at p; N if no '\n'.
+  const lineEnd = (p) => { const e = src.indexOf('\n', p); return e === -1 ? N : e; };
+  while (pos <= N) {
+    const a = pos;
+    const b = lineEnd(pos);
+    const nextPos = b + 1;
+    const [k, pay] = classify(src, a, b);
+    if (k === 1) { pos = nextPos; if (b === N) break; continue; }
     if (k === 2) {
-      const lang = pay[i];
+      const lang = pay;
       parts.push('<pre><code');
-      if (lang !== '') {
-        parts.push(' class="language-');
-        escPush(lang, parts);
-        parts.push('"');
-      }
+      if (lang !== '') { parts.push(' class="language-'); escPush(lang, parts); parts.push('"'); }
       parts.push('>');
-      i++;
-      const bodyLines = [];
-      while (i < n && !isFenceClose(lines[i])) bodyLines.push(lines[i++]);
-      i++;
-      if (bodyLines.length > 0) escPush(`${bodyLines.join('\n')}\n`, parts);
+      // body lines: from nextPos until a fence-close line (or end of src)
+      let bodyStart = nextPos, bodyEnd = N, closed = false, p2 = nextPos;
+      while (p2 <= N) {
+        const a2 = p2, b2 = lineEnd(p2);
+        if (b2 > a2 && isFenceCloseRange(src, a2, b2)) { bodyEnd = a2; closed = true; p2 = b2 + 1; break; }
+        if (b2 === N) { bodyEnd = N; p2 = N + 1; break; }
+        p2 = b2 + 1;
+      }
+      if (closed) {
+        // body slice already ends with '\n' when non-empty (closing line is preceded by one)
+        if (bodyEnd > bodyStart) escPush(src.slice(bodyStart, bodyEnd), parts);
+      } else if (b < N) {
+        // unclosed: the old join('\n')+'\n' always appends one extra '\n' beyond the raw slice
+        escPush(src.slice(bodyStart, N) + '\n', parts);
+      }
       parts.push('</code></pre>\n');
+      pos = closed ? p2 : N + 1;
+      if (pos > N) break;
       continue;
     }
     if (k === 3) {
-      const heading = pay[i];
+      const heading = pay;
       const id = uniqueSlug(slugify(heading.text), ids);
       const html = inline(heading.text, env);
       parts.push(`<h${heading.depth} id="${id}">`, html, `</h${heading.depth}>\n`);
       if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
-      i++;
+      pos = nextPos;
+      if (b === N) break;
       continue;
     }
     if (k === 4) {
       parts.push('<hr>\n');
-      i++;
+      pos = nextPos;
+      if (b === N) break;
       continue;
     }
     if (k === 5) {
+      // quote: collect lines starting with '>'
       const stripped = [];
-      while (i < n && kindOf(i) === 5) {
-        const l = lines[i++];
-        stripped.push(l.slice(l.charCodeAt(1) === 32 ? 2 : 1));
+      let p2 = pos;
+      while (p2 <= N) {
+        const a2 = p2, b2 = lineEnd(p2);
+        if (!(b2 > a2 && src.charCodeAt(a2) === 62)) break;
+        // strip '>' + optional single space
+        const st = src.charCodeAt(a2 + 1) === 32 ? a2 + 2 : a2 + 1;
+        stripped.push([st, b2]);
+        if (b2 === N) { p2 = N + 1; break; }
+        p2 = b2 + 1;
       }
       const kept = [];
-      for (const l of stripped) {
-        const t = trimLine(l);
-        if (t !== '') kept.push(t);
+      for (const [sa, sb] of stripped) {
+        const [ta, tb] = trimRange(src, sa, sb);
+        if (ta < tb) kept.push(src.slice(ta, tb));
       }
       if (kept.length === 0) parts.push('<blockquote>\n</blockquote>\n');
       else {
@@ -621,20 +595,39 @@ export function renderMarkdown(src, env) {
         inlineTo(kept.join('\n'), env, parts);
         parts.push('</p>\n</blockquote>\n');
       }
+      pos = p2;
+      if (p2 > N) break;
       continue;
     }
     if (k === 6) {
-      const first = pay[i];
+      const first = pay;
       const isOrdered = first.ordered;
-      const items = [[trimLine(first.text)]];
-      i++;
-      while (i < n) {
-        if (kindOf(i) === 6 && pay[i].ordered === isOrdered) {
-          items.push([trimLine(pay[i].text)]);
-          i++;
-        } else if (lines[i].startsWith('  ') && CONTINUED.test(lines[i])) {
-          items[items.length - 1].push(trimLine(lines[i]));
-          i++;
+      const items = [];
+      // first item text: trimRange of first.text — but first.text is a slice; redo from range:
+      // recompute: for unordered, text starts at a+2; for ordered, after the digits+'. '
+      let tstart;
+      if (!isOrdered) tstart = a + 2;
+      else { let j = a; while (j < b && src.charCodeAt(j) >= 48 && src.charCodeAt(j) <= 57) j++; tstart = j + 2; }
+      const [fta, ftb] = trimRange(src, tstart, b);
+      items.push([src.slice(fta, ftb)]);
+      let p2 = nextPos;
+      while (p2 <= N) {
+        const a2 = p2, b2 = lineEnd(p2);
+        if (b2 === N && a2 === N) break;
+        const [k2, pay2] = classify(src, a2, b2);
+        if (k2 === 6 && pay2.ordered === isOrdered) {
+          let ts;
+          if (!isOrdered) ts = a2 + 2;
+          else { let j = a2; while (j < b2 && src.charCodeAt(j) >= 48 && src.charCodeAt(j) <= 57) j++; ts = j + 2; }
+          const [ta, tb] = trimRange(src, ts, b2);
+          items.push([src.slice(ta, tb)]);
+          if (b2 === N) { p2 = N + 1; break; }
+          p2 = b2 + 1;
+        } else if (b2 - a2 >= 2 && src.charCodeAt(a2) === 32 && src.charCodeAt(a2 + 1) === 32 && CONTINUED.test(src.slice(a2, b2))) {
+          const [ta, tb] = trimRange(src, a2, b2);
+          items[items.length - 1].push(src.slice(ta, tb));
+          if (b2 === N) { p2 = N + 1; break; }
+          p2 = b2 + 1;
         } else break;
       }
       const tag = isOrdered ? 'ol' : 'ul';
@@ -645,27 +638,43 @@ export function renderMarkdown(src, env) {
         parts.push('</li>\n');
       }
       parts.push(`</${tag}>\n`);
+      pos = p2;
+      if (p2 > N) break;
       continue;
     }
-    const body = [trimLine(lines[i])];
-    i++;
-    while (i < n) {
-      const kk = kindOf(i);
-      if (kk === 1 || kk === 2 || kk === 3 || kk === 4) break;
-      body.push(trimLine(lines[i++]));
+    // paragraph: collect lines until blank/fence/heading/hr
+    const body = [];
+    {
+      const [ta, tb] = trimRange(src, a, b);
+      body.push(src.slice(ta, tb));
     }
+    let p2 = nextPos;
+    while (p2 <= N) {
+      const a2 = p2, b2 = lineEnd(p2);
+      if (b2 === N && a2 === N) break;
+      const [k2] = classify(src, a2, b2);
+      if (k2 === 1 || k2 === 2 || k2 === 3 || k2 === 4) break;
+      const [ta, tb] = trimRange(src, a2, b2);
+      body.push(src.slice(ta, tb));
+      if (b2 === N) { p2 = N + 1; break; }
+      p2 = b2 + 1;
+    }
+    const joined = body.join('\n');
     if (excerpt === null) {
-      const html = inline(body.join('\n'), env);
+      const html = inline(joined, env);
       excerpt = html;
       parts.push('<p>', html, '</p>\n');
     } else {
       parts.push('<p>');
-      inlineTo(body.join('\n'), env, parts);
+      inlineTo(joined, env, parts);
       parts.push('</p>\n');
     }
+    pos = p2;
+    if (p2 > N) break;
   }
   return { html: parts.join(''), toc, excerpt: excerpt ?? '' };
 }
+
 
 // ---------------------------------------------------------------- templates
 
@@ -886,15 +895,49 @@ export function renderNodes(nodes, scope, ctx, depth, out) {
       case 'text':
         out.push(n.text);
         break;
-      case 'var':
-        escPush(textOf(lookup(scope, n.path)), out);
+      case 'var': {
+        // Inlined lookup + textOf: the common case (a string value) takes
+        // one escPush and no helper call. The resolution mirrors lookup()
+        // exactly: the first name from the nearest scope holding it, then
+        // own properties; a missing step or a non-object mid-path is
+        // undefined.
+        const p = n.path;
+        let s = scope;
+        while (s !== null && !Object.hasOwn(s.vars, p[0])) s = s.parent;
+        let v = s === null ? undefined : s.vars[p[0]];
+        for (let k = 1; k < p.length; k++) {
+          if (v === null || typeof v !== 'object' || !Object.hasOwn(v, p[k])) { v = undefined; break; }
+          v = v[p[k]];
+        }
+        if (typeof v === 'string') escPush(v, out);
+        else escPush(textOf(v), out);
         break;
-      case 'raw':
-        out.push(textOf(lookup(scope, n.path)));
+      }
+      case 'raw': {
+        const p = n.path;
+        let s = scope;
+        while (s !== null && !Object.hasOwn(s.vars, p[0])) s = s.parent;
+        let v = s === null ? undefined : s.vars[p[0]];
+        for (let k = 1; k < p.length; k++) {
+          if (v === null || typeof v !== 'object' || !Object.hasOwn(v, p[k])) { v = undefined; break; }
+          v = v[p[k]];
+        }
+        out.push(typeof v === 'string' ? v : textOf(v));
         break;
+      }
       case 'if': {
-        const v = truthy(lookup(scope, n.path));
-        const branch = v !== n.not ? n.then : n.else;
+        const p = n.path;
+        let s = scope;
+        while (s !== null && !Object.hasOwn(s.vars, p[0])) s = s.parent;
+        let v = s === null ? undefined : s.vars[p[0]];
+        for (let k = 1; k < p.length; k++) {
+          if (v === null || typeof v !== 'object' || !Object.hasOwn(v, p[k])) { v = undefined; break; }
+          v = v[p[k]];
+        }
+        // Inlined truthy(): an array counts by length, anything else by
+        // not being undefined, null, false, "" or 0.
+        const tv = Array.isArray(v) ? v.length > 0 : (v !== undefined && v !== null && v !== false && v !== '' && v !== 0);
+        const branch = tv !== n.not ? n.then : n.else;
         if (branch !== null) renderNodes(branch, scope, ctx, depth, out);
         break;
       }
