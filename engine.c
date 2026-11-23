@@ -168,6 +168,22 @@ static void buf_put_str(Buf *b, Str s) { buf_put(b, s.p, s.len); }
 // ---------------------------------------------------------------- JSON parse (recursive descent over bytes, fills structs)
 typedef struct { const uint8_t *p, *end; Arena *arena; } J;
 static void j_ws(J *j) {
+  // SIMD skip of JSON whitespace (space, tab, LF, CR), 16 bytes at a time.
+  __m128i v20 = _mm_set1_epi8(' ');
+  __m128i v09 = _mm_set1_epi8('\t');
+  __m128i v0a = _mm_set1_epi8('\n');
+  __m128i v0d = _mm_set1_epi8('\r');
+  while (j->p + 16 <= j->end) {
+    __m128i v = _mm_loadu_si128((const __m128i *)j->p);
+    __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, v20),
+                  _mm_or_si128(_mm_cmpeq_epi8(v, v09),
+                  _mm_or_si128(_mm_cmpeq_epi8(v, v0a), _mm_cmpeq_epi8(v, v0d))));
+    unsigned mask = (unsigned)_mm_movemask_epi8(m);
+    if (mask == 0xFFFF) { j->p += 16; continue; }
+    // first non-whitespace byte in this block
+    j->p += (size_t)__builtin_ctz(~mask);
+    return;
+  }
   while (j->p < j->end) {
     uint8_t c = *j->p;
     if (c == ' ' || c == '\t' || c == '\n' || c == '\r') j->p++;
@@ -318,9 +334,17 @@ static void j_skip(J *j) {
 // '\\' (0x5C), or 0xED (WTF-8 lone-surrogate lead).
 static const char HEXD[] = "0123456789abcdef";
 static void json_emit_str(Buf *b, Str s) {
-  buf_putc(b, '"');
+  // Fast path: reserve room for the string + typical escape expansion (25%)
+  // and write through a raw cursor -- no per-hit buf_put calls. The answers
+  // carry ~280k escapes (every \" and \n in the html), and each buf_put was
+  // a function call + reserve check. On overflow (pathological escape
+  // density) fall through to the slow buf_put loop for the remainder; the
+  // opening quote is already written and p/run are the resume point.
   const uint8_t *p = s.p, *end = s.p + s.len;
   const uint8_t *run = p;
+  buf_reserve(b, s.len + s.len / 4 + 18);
+  uint8_t *dst = b->buf + b->len;
+  uint8_t *dst_end = b->buf + b->cap;
   __m128i v22 = _mm_set1_epi8(0x22);
   __m128i v5c = _mm_set1_epi8(0x5C);
   __m128i ved = _mm_set1_epi8((char)0xED);
@@ -330,6 +354,7 @@ static void json_emit_str(Buf *b, Str s) {
   // bug: 1011/1024 practice bodies mismatched before the fix.)
   __m128i vbias = _mm_set1_epi8((char)0x80);
   __m128i vlt = _mm_set1_epi8((char)0xA0); // 0x20 ^ 0x80
+  *dst++ = '"';
   while (p + 16 <= end) {
     __m128i v = _mm_loadu_si128((const __m128i *)p);
     __m128i m = _mm_or_si128(_mm_cmplt_epi8(_mm_xor_si128(v, vbias), vlt),
@@ -337,7 +362,83 @@ static void json_emit_str(Buf *b, Str s) {
                   _mm_or_si128(_mm_cmpeq_epi8(v, v5c), _mm_cmpeq_epi8(v, ved))));
     unsigned mask = (unsigned)_mm_movemask_epi8(m);
     if (!mask) { p += 16; continue; }
-    // first set bit
+    unsigned bit = __builtin_ctz(mask);
+    const uint8_t *hit = p + bit;
+    size_t runlen = (size_t)(hit - run);
+    if (dst + runlen + 6 > dst_end) goto emit_slow;
+    if (runlen) { __builtin_memcpy(dst, run, runlen); dst += runlen; }
+    uint8_t c = *hit;
+    if (c == '"') { dst[0] = '\\'; dst[1] = '"'; dst += 2; }
+    else if (c == '\\') { dst[0] = '\\'; dst[1] = '\\'; dst += 2; }
+    else if (c == '\b') { dst[0] = '\\'; dst[1] = 'b'; dst += 2; }
+    else if (c == '\f') { dst[0] = '\\'; dst[1] = 'f'; dst += 2; }
+    else if (c == '\n') { dst[0] = '\\'; dst[1] = 'n'; dst += 2; }
+    else if (c == '\r') { dst[0] = '\\'; dst[1] = 'r'; dst += 2; }
+    else if (c == '\t') { dst[0] = '\\'; dst[1] = 't'; dst += 2; }
+    else if (c < 0x20) {
+      dst[0] = '\\'; dst[1] = 'u'; dst[2] = '0'; dst[3] = '0';
+      dst[4] = (uint8_t)HEXD[c >> 4]; dst[5] = (uint8_t)HEXD[c & 15]; dst += 6;
+    } else { // 0xED: WTF-8 lone surrogate ED A0..BF xx -> \uDXXX
+      if (hit + 2 < end && (hit[1] & 0xE0) == 0xA0) {
+        uint32_t cp = ((hit[1] & 0xF0) == 0xA0 ? 0xD800 : 0xDC00) + ((hit[1] & 0x0F) << 6) + (hit[2] & 0x3F);
+        dst[0] = '\\'; dst[1] = 'u';
+        dst[2] = (uint8_t)HEXD[(cp >> 12) & 15]; dst[3] = (uint8_t)HEXD[(cp >> 8) & 15];
+        dst[4] = (uint8_t)HEXD[(cp >> 4) & 15]; dst[5] = (uint8_t)HEXD[cp & 15]; dst += 6;
+        p = hit + 3; run = p;
+        continue;
+      }
+      *dst++ = c;
+      p = hit + 1; run = p;
+      continue;
+    }
+    p = hit + 1; run = p;
+  }
+  while (p < end) {
+    uint8_t c = *p;
+    if (c < 0x20 || c == '"' || c == '\\' || c == 0xED) {
+      size_t runlen = (size_t)(p - run);
+      if (dst + runlen + 6 > dst_end) goto emit_slow;
+      if (runlen) { __builtin_memcpy(dst, run, runlen); dst += runlen; }
+      if (c == '"') { dst[0] = '\\'; dst[1] = '"'; dst += 2; }
+      else if (c == '\\') { dst[0] = '\\'; dst[1] = '\\'; dst += 2; }
+      else if (c == '\b') { dst[0] = '\\'; dst[1] = 'b'; dst += 2; }
+      else if (c == '\f') { dst[0] = '\\'; dst[1] = 'f'; dst += 2; }
+      else if (c == '\n') { dst[0] = '\\'; dst[1] = 'n'; dst += 2; }
+      else if (c == '\r') { dst[0] = '\\'; dst[1] = 'r'; dst += 2; }
+      else if (c == '\t') { dst[0] = '\\'; dst[1] = 't'; dst += 2; }
+      else if (c < 0x20) {
+        dst[0] = '\\'; dst[1] = 'u'; dst[2] = '0'; dst[3] = '0';
+        dst[4] = (uint8_t)HEXD[c >> 4]; dst[5] = (uint8_t)HEXD[c & 15]; dst += 6;
+      } else if (p + 2 < end && (p[1] & 0xE0) == 0xA0) {
+        uint32_t cp = ((p[1] & 0xF0) == 0xA0 ? 0xD800 : 0xDC00) + ((p[1] & 0x0F) << 6) + (p[2] & 0x3F);
+        dst[0] = '\\'; dst[1] = 'u';
+        dst[2] = (uint8_t)HEXD[(cp >> 12) & 15]; dst[3] = (uint8_t)HEXD[(cp >> 8) & 15];
+        dst[4] = (uint8_t)HEXD[(cp >> 4) & 15]; dst[5] = (uint8_t)HEXD[cp & 15]; dst += 6;
+        p += 3; run = p;
+        continue;
+      } else *dst++ = c;
+      p++; run = p;
+    } else p++;
+  }
+  {
+    size_t runlen = (size_t)(end - run);
+    if (dst + runlen + 1 > dst_end) goto emit_slow;
+    if (runlen) { __builtin_memcpy(dst, run, runlen); dst += runlen; }
+    *dst++ = '"';
+    b->len = (size_t)(dst - b->buf);
+    return;
+  }
+emit_slow:
+  // Commit what the fast path wrote, then continue with the buf_put loop
+  // from (p, run). The opening quote is already emitted.
+  b->len = (size_t)(dst - b->buf);
+  while (p + 16 <= end) {
+    __m128i v = _mm_loadu_si128((const __m128i *)p);
+    __m128i m = _mm_or_si128(_mm_cmplt_epi8(_mm_xor_si128(v, vbias), vlt),
+                  _mm_or_si128(_mm_cmpeq_epi8(v, v22),
+                  _mm_or_si128(_mm_cmpeq_epi8(v, v5c), _mm_cmpeq_epi8(v, ved))));
+    unsigned mask = (unsigned)_mm_movemask_epi8(m);
+    if (!mask) { p += 16; continue; }
     unsigned bit = __builtin_ctz(mask);
     const uint8_t *hit = p + bit;
     if (hit > run) buf_put(b, run, (size_t)(hit - run));
@@ -350,21 +451,13 @@ static void json_emit_str(Buf *b, Str s) {
     else if (c == '\r') buf_puts(b, "\\r");
     else if (c == '\t') buf_puts(b, "\\t");
     else if (c < 0x20) { char e[7] = { '\\', 'u', '0', '0', HEXD[c >> 4], HEXD[c & 15], 0 }; buf_put(b, e, 6); }
-    else { // 0xED: WTF-8 lone surrogate ED A0..BF xx -> \uDXXX
-      if (hit + 2 < end && (hit[1] & 0xE0) == 0xA0) {
-        uint32_t cp = 0xD800 + ((hit[1] & 0x0F) << 6) + (hit[2] & 0x3F);
-        // high surrogate D800-DBFF from A0-AF, low DC00-DFFF from B0-BF
-        cp = ((hit[1] & 0xF0) == 0xA0 ? 0xD800 : 0xDC00) + ((hit[1] & 0x0F) << 6) + (hit[2] & 0x3F);
-        char e[7] = { '\\', 'u', HEXD[(cp >> 12) & 15], HEXD[(cp >> 8) & 15], HEXD[(cp >> 4) & 15], HEXD[cp & 15], 0 };
-        buf_put(b, e, 6);
-        p = hit + 3; run = p;
-        continue;
-      }
-      // stray 0xED not part of a surrogate: copy raw (cannot occur from valid JSON)
-      buf_putc(b, c);
-      p = hit + 1; run = p;
+    else if (hit + 2 < end && (hit[1] & 0xE0) == 0xA0) {
+      uint32_t cp = ((hit[1] & 0xF0) == 0xA0 ? 0xD800 : 0xDC00) + ((hit[1] & 0x0F) << 6) + (hit[2] & 0x3F);
+      char e[7] = { '\\', 'u', HEXD[(cp >> 12) & 15], HEXD[(cp >> 8) & 15], HEXD[(cp >> 4) & 15], HEXD[cp & 15], 0 };
+      buf_put(b, e, 6);
+      p = hit + 3; run = p;
       continue;
-    }
+    } else buf_putc(b, c);
     p = hit + 1; run = p;
   }
   while (p < end) {
@@ -1231,10 +1324,10 @@ static int has_scheme(Str t) {
   }
   return i < t.len && t.p[i] == ':';
 }
-static Str link_resolve(LinkCtx *ctx, Str target) {
+static Str link_resolve(LinkCtx *ctx, Str target, int *broken_out) {
   Build *b = ctx->b;
   Arena *a = b->arena;
-  if (has_scheme(target) || (target.len > 0 && target.p[0] == '/') || (target.len > 0 && target.p[0] == '#')) return target;
+  if (has_scheme(target) || (target.len > 0 && target.p[0] == '/') || (target.len > 0 && target.p[0] == '#')) { *broken_out = 0; return target; }
   // split off #fragment
   size_t hash = 0;
   int has_hash = 0;
@@ -1260,6 +1353,7 @@ static Str link_resolve(LinkCtx *ctx, Str target) {
       for (size_t i = 0; i < s->url.len; i++) o[n++] = s->url.p[i];
       for (size_t i = 0; i < frag.len; i++) o[n++] = frag.p[i];
       Str r = { o, n };
+      *broken_out = 0;
       return r;
     }
     if (strset_has(&b->static_paths, path)) {
@@ -1270,24 +1364,31 @@ static Str link_resolve(LinkCtx *ctx, Str target) {
       for (size_t i = 0; i < path.len; i++) o[n++] = path.p[i];
       for (size_t i = 0; i < frag.len; i++) o[n++] = frag.p[i];
       Str r = { o, n };
+      *broken_out = 0;
       return r;
     }
   }
-  // broken link: report once (dedup by message)
-  {
-    const char *pre = "broken-link ";
-    const char *mid = " -> ";
-    size_t total = 12 + ctx->src_path.len + 4 + target.len;
-    uint8_t *o = arena_alloc(a, total + 1);
-    size_t n = 0;
-    for (size_t i = 0; pre[i]; i++) o[n++] = (uint8_t)pre[i];
-    for (size_t i = 0; i < ctx->src_path.len; i++) o[n++] = ctx->src_path.p[i];
-    for (size_t i = 0; mid[i]; i++) o[n++] = (uint8_t)mid[i];
-    for (size_t i = 0; i < target.len; i++) o[n++] = target.p[i];
-    Str msg = { o, n };
-    if (!strset_has(&b->broken, msg)) strset_add(&b->broken, msg);
-  }
+  *broken_out = 1;
   return target;
+}
+// Report a broken link once per (source, target), deduped by message.
+// Called by linkFn for EVERY unresolved occurrence -- including memo hits
+// (the memo caches the resolution, not the report: two sources in one
+// directory linking the same broken target each get their own line).
+static void report_broken_link(LinkCtx *ctx, Str target) {
+  Build *b = ctx->b;
+  Arena *a = b->arena;
+  const char *pre = "broken-link ";
+  const char *mid = " -> ";
+  size_t total = 12 + ctx->src_path.len + 4 + target.len;
+  uint8_t *o = arena_alloc(a, total + 1);
+  size_t n = 0;
+  for (size_t i = 0; pre[i]; i++) o[n++] = (uint8_t)pre[i];
+  for (size_t i = 0; i < ctx->src_path.len; i++) o[n++] = ctx->src_path.p[i];
+  for (size_t i = 0; mid[i]; i++) o[n++] = (uint8_t)mid[i];
+  for (size_t i = 0; i < target.len; i++) o[n++] = target.p[i];
+  Str msg = { o, n };
+  if (!strset_has(&b->broken, msg)) strset_add(&b->broken, msg);
 }
 
 // ---------------------------------------------------------------- markdown (md_core.c)
@@ -1324,7 +1425,7 @@ static void md_toc_push(MdOut *res, int level, Str id, Str html) {
 // the same (dir, target) pairs repeat across bodies (5,747 linkFn calls/run).
 // 128-slot direct-mapped cache; entries hold arena Strs valid for one case
 // only, so the cache is cleared at the start of each build_case.
-typedef struct { int valid; Str dir; Str target; Str url; int resolved; } LinkMemo;
+typedef struct { int valid; Str dir; Str target; Str url; int broken; } LinkMemo;
 static LinkMemo g_link_memo[128];
 static void link_memo_clear(void) {
   for (int i = 0; i < 128; i++) g_link_memo[i].valid = 0;
@@ -1351,15 +1452,15 @@ int linkFn(const uint8_t *p, int len) {
   uint64_t h = link_memo_hash(g_md_ctx->dir, target);
   LinkMemo *m = &g_link_memo[h & 127];
   Str url;
+  int broken;
   if (m->valid && str_eq(m->dir, g_md_ctx->dir) && str_eq(m->target, target)) {
-    if (!m->resolved) return 0;
     url = m->url;
+    broken = m->broken;
   } else {
-    url = link_resolve(g_md_ctx, target);
-    int resolved = !(url.len == target.len && (url.p == target.p || __builtin_memcmp(url.p, target.p, url.len) == 0));
-    m->valid = 1; m->dir = g_md_ctx->dir; m->target = target; m->url = url; m->resolved = resolved;
-    if (!resolved) return 0;
+    url = link_resolve(g_md_ctx, target, &broken);
+    m->valid = 1; m->dir = g_md_ctx->dir; m->target = target; m->url = url; m->broken = broken;
   }
+  if (broken) { report_broken_link(g_md_ctx, target); return 0; }
   uint8_t *sc = scratch_ptr();
   md_store_u32(sc, (uint32_t)url.len);
   __builtin_memcpy(sc + 4, url.p, url.len);
@@ -1709,6 +1810,141 @@ static int parse_template(Str name, Str src, Arena *a, Tmpl *t) {
   return 1;
 }
 
+// ---- include-render memo (v7.2) ----
+// The layouts step re-renders the same partials thousands of times: every
+// post's card appears once on an index page and once per tag page (~5x), and
+// every tag-list inside it too. Memoizing an include render whose output
+// depends only on case-globals (site/tags/recent) plus the values of the
+// loop variables bound at the include point cuts ~2/3 of the layouts work.
+//
+// Correctness: an include of template U at a render point with bound names
+// B (the loop variables on the scope chain) is cacheable iff
+//   free(U, B) subset of {site, tags, recent}
+// where free(U, B) = names U reads (transitively through includes) that are
+// neither in B nor bound by U's own for-loops at the read point, and
+//   loop not in outer(U, B)
+// (the loop object is mutated per iteration, so its pointer is not a key).
+// outer(U, B) = names in B that U reads where the innermost binding is B
+// (not shadowed by U's own for-loops). The memo key is (U, the Value*
+// pointers of outer(U, B)) — those Values are created once per case, so the
+// pointers are stable within a case. Tables are cleared per build_case.
+//
+// Name interning: template variable names are mapped to ids 0..63 for
+// bitmasks. More than 64 distinct names -> analysis reports uncacheable
+// (safe fallback); the memo never caches then.
+
+#define MEMO_MAX_NAMES 64
+static Str g_memo_names[MEMO_MAX_NAMES];
+static int g_memo_nnames = 0;
+static int memo_name_id(Str name) {
+  for (int i = 0; i < g_memo_nnames; i++) if (str_eq(g_memo_names[i], name)) return i;
+  if (g_memo_nnames >= MEMO_MAX_NAMES) return -1;
+  g_memo_names[g_memo_nnames] = name;
+  return g_memo_nnames++;
+}
+static int memo_id_of_cstr(const char *s) {
+  Str name = { (const uint8_t *)s, __builtin_strlen(s) };
+  return memo_name_id(name);
+}
+
+typedef struct { uint64_t free_mask; uint64_t outer_mask; int bad; } TmplAnalysis;
+
+// Walk a template's ops (linear scan; for/endfor nest properly) collecting
+// free reads (neither in outer_bound nor bound by this template's own fors
+// at the read point) and outer reads (in outer_bound and not shadowed by
+// this template's own fors). Recurses into includes with
+// outer_bound' = outer_bound | own bindings at the include point.
+// depth caps the include recursion at 8, matching the renderer.
+static TmplAnalysis memo_analyze(Tmpl *tm, uint64_t outer_bound, int depth, HMap *tmap) {
+  TmplAnalysis res; res.free_mask = 0; res.outer_mask = 0; res.bad = 0;
+  if (!tm || depth > 8) { res.bad = 1; return res; }
+  uint64_t own_stack[16];
+  int own_sp = 0;
+  uint64_t own_mask = 0;
+  for (int i = 0; i < tm->nops; i++) {
+    Op *op = &tm->ops[i];
+    int id;
+    switch (op->kind) {
+      case OP_VAR:
+      case OP_RAW:
+      case OP_IF:
+      case OP_FOR: {
+        if (op->npath < 1) break;
+        id = memo_name_id(op->path[0]);
+        if (id < 0) { res.bad = 1; return res; }
+        uint64_t bit = 1ULL << id;
+        if (!(own_mask & bit)) {
+          if (outer_bound & bit) res.outer_mask |= bit;
+          else res.free_mask |= bit;
+        }
+        if (op->kind == OP_FOR) {
+          int vid = memo_name_id(op->varname);
+          int lid = memo_id_of_cstr("loop");
+          if (vid < 0 || lid < 0) { res.bad = 1; return res; }
+          if (own_sp >= 16) { res.bad = 1; return res; }
+          own_stack[own_sp++] = own_mask;
+          own_mask |= (1ULL << vid) | (1ULL << lid);
+        }
+        break;
+      }
+      case OP_ENDFOR: {
+        if (own_sp > 0) own_mask = own_stack[--own_sp];
+        break;
+      }
+      case OP_INCLUDE: {
+        Template *t = hmap_get(tmap, op->incname);
+        if (t && !t->parse_err) {
+          Tmpl *sub = (Tmpl *)t->ops;
+          TmplAnalysis sub_res = memo_analyze(sub, outer_bound | own_mask, depth + 1, tmap);
+          if (sub_res.bad) { res.bad = 1; return res; }
+          res.free_mask |= sub_res.free_mask;
+          // only deps in THIS level's outer_bound are inputs; deps bound by
+          // this template's own for-loops are derived inside the render.
+          res.outer_mask |= (sub_res.outer_mask & outer_bound);
+        }
+        break;
+      }
+      default: break;
+    }
+  }
+  return res;
+}
+
+// Analysis cache: keyed by (Tmpl*, outer_bound mask). Cleared per build_case
+// (Tmpl pointers are per-case arena addresses and must not outlive a case).
+#define MEMO_ANALYSIS_SLOTS 256
+typedef struct { int valid; Tmpl *tm; uint64_t bound; TmplAnalysis res; } MemoAnalysisSlot;
+static MemoAnalysisSlot g_memo_analysis[MEMO_ANALYSIS_SLOTS];
+static uint32_t g_memo_gen = 0;
+static TmplAnalysis *memo_analysis_for(Tmpl *tm, uint64_t bound, HMap *tmap) {
+  uint64_t h = ((uint64_t)(uintptr_t)tm * 1099511628211ULL) ^ (bound * 1469598103934665603ULL);
+  size_t slot = (size_t)(h & (MEMO_ANALYSIS_SLOTS - 1));
+  for (int probe = 0; probe < MEMO_ANALYSIS_SLOTS; probe++) {
+    MemoAnalysisSlot *s = &g_memo_analysis[(slot + probe) & (MEMO_ANALYSIS_SLOTS - 1)];
+    if (!s->valid) {
+      s->valid = 1; s->tm = tm; s->bound = bound;
+      s->res = memo_analyze(tm, bound, 0, tmap);
+      return &s->res;
+    }
+    if (s->tm == tm && s->bound == bound) return &s->res;
+  }
+  return NULL; // table full: do not cache this include
+}
+
+// Render memo: keyed by (Template*, outer-dep Value* pointers, up to 4).
+// open addressing, 16384 slots, generation-gated per build_case.
+#define MEMO_SLOTS 16384
+typedef struct { uint32_t gen; Template *tm; int ndep; Value *dep[4]; Str html; } MemoSlot;
+static MemoSlot g_memo[MEMO_SLOTS];
+static uint64_t g_memo_hits = 0, g_memo_miss = 0, g_memo_nocache = 0;
+static void memo_tables_clear(void) {
+  g_memo_gen++;
+  for (int i = 0; i < MEMO_ANALYSIS_SLOTS; i++) g_memo_analysis[i].valid = 0;
+  // g_memo entries are generation-gated; no memset needed.
+  // the name-interning table holds Strs into the case arena: reset it too.
+  g_memo_nnames = 0;
+}
+
 // ---------------------------------------------------------------- template render
 typedef struct Scope { Str *names; Value **vals; int n; struct Scope *parent; } Scope;
 typedef struct { Build *b; } TmplCtx;
@@ -1782,6 +2018,67 @@ static int truthy_v(Value *v) {
   if (v->kind == V_NUM) return v->num != 0;
   return 1; // object
 }
+static void render_range(Op *ops, int start, int end, Scope *scope, TmplCtx *tctx, int depth, Buf *out);
+
+// Try to serve an {% include %} from the render memo. Returns 1 if the
+// include was rendered (hit or miss-stored) and appended to out, 0 if the
+// caller must render it normally (not cacheable).
+static int memo_include(Tmpl *tm, Template *t, Scope *scope, TmplCtx *tctx, int depth, Buf *out) {
+  Arena *a = tctx->b->arena;
+  // Bound names at this render point: the loop variables on the scope chain.
+  // A for-loop frame has exactly 2 names, the second being "loop".
+  uint64_t bound_mask = 0;
+  for (Scope *s = scope; s; s = s->parent) {
+    if (s->n == 2 && str_eq(s->names[1], str_from("loop"))) {
+      int id0 = memo_name_id(s->names[0]);
+      int id1 = memo_id_of_cstr("loop");
+      if (id0 < 0 || id1 < 0) return 0;
+      bound_mask |= (1ULL << id0) | (1ULL << id1);
+    }
+  }
+  TmplAnalysis *an = memo_analysis_for(tm, bound_mask, &tctx->b->template_map);
+  if (!an || an->bad) return 0;
+  int id_site = memo_id_of_cstr("site");
+  int id_tags = memo_id_of_cstr("tags");
+  int id_recent = memo_id_of_cstr("recent");
+  int id_loop = memo_id_of_cstr("loop");
+  if (id_site < 0 || id_tags < 0 || id_recent < 0 || id_loop < 0) return 0;
+  uint64_t globals = (1ULL << id_site) | (1ULL << id_tags) | (1ULL << id_recent);
+  if (an->free_mask & ~globals) return 0; // reads a per-render name (page, ...)
+  if (an->outer_mask & (1ULL << id_loop)) return 0; // reads the mutating loop object
+  Value *dep[4];
+  int ndep = 0;
+  for (int id = 0; id < MEMO_MAX_NAMES; id++) {
+    if (!(an->outer_mask & (1ULL << id))) continue;
+    if (ndep >= 4) return 0;
+    Value *v = scope_lookup(scope, &g_memo_names[id], 1, a);
+    if (!v) return 0;
+    dep[ndep++] = v;
+  }
+  uint64_t h = (uint64_t)(uintptr_t)t * 1099511628211ULL;
+  for (int i = 0; i < ndep; i++) h ^= ((uint64_t)(uintptr_t)dep[i] * 1469598103934665603ULL) + (uint64_t)(i + 1);
+  size_t slot = (size_t)(h & (MEMO_SLOTS - 1));
+  for (int probe = 0; probe < MEMO_SLOTS; probe++) {
+    MemoSlot *m = &g_memo[(slot + probe) & (MEMO_SLOTS - 1)];
+    if (m->gen != g_memo_gen) {
+      Buf tmp; buf_init(&tmp, a, 1024);
+      render_range(tm->ops, 0, tm->nops, scope, tctx, depth + 1, &tmp);
+      m->gen = g_memo_gen; m->tm = t; m->ndep = ndep;
+      for (int i = 0; i < ndep; i++) m->dep[i] = dep[i];
+      m->html.p = tmp.buf; m->html.len = tmp.len;
+      g_memo_miss++;
+      buf_put_str(out, m->html);
+      return 1;
+    }
+    if (m->tm == t && m->ndep == ndep) {
+      int eq = 1;
+      for (int i = 0; i < ndep; i++) if (m->dep[i] != dep[i]) { eq = 0; break; }
+      if (eq) { g_memo_hits++; buf_put_str(out, m->html); return 1; }
+    }
+  }
+  return 0; // memo table full: render normally
+}
+
 static void render_range(Op *ops, int start, int end, Scope *scope, TmplCtx *tctx, int depth, Buf *out) {
   Arena *a = tctx->b->arena;
   for (int i = start; i < end; i++) {
@@ -1847,7 +2144,8 @@ static void render_range(Op *ops, int start, int end, Scope *scope, TmplCtx *tct
           Template *t = hmap_get(&tctx->b->template_map, op->incname);
           if (t && !t->parse_err) {
             Tmpl *tm = (Tmpl *)t->ops;
-            render_range(tm->ops, 0, tm->nops, scope, tctx, depth + 1, out);
+            if (!memo_include(tm, t, scope, tctx, depth, out))
+              render_range(tm->ops, 0, tm->nops, scope, tctx, depth + 1, out);
           }
         }
         break;
@@ -2019,6 +2317,7 @@ static Value *tag_of(Build *b, Tag *t) {
 
 // ---------------------------------------------------------------- build one case
 static void build_case(Input *in, Arena *a, Build *b) {
+  memo_tables_clear();
   b->arena = a; b->input = in;
   b->nreport = 0; b->report_cap = 0; b->report = NULL;
   b->nsources = 0; b->sources_cap = 0; b->sources = NULL;
@@ -2937,6 +3236,11 @@ static int cmd_benchsteps(int argc, char **argv) {
     buf_puts(&ob, " us\n");
     tot += g_step_us[i];
   }
+  buf_puts(&ob, "memo hits: ");
+  tm_put_u64(&ob, g_memo_hits);
+  buf_puts(&ob, " miss(store): ");
+  tm_put_u64(&ob, g_memo_miss);
+  buf_puts(&ob, "\n");
   buf_puts(&ob, "build+emit steps total: ");
   tm_put_u64(&ob, tot);
   buf_puts(&ob, " us; wall total: ");
